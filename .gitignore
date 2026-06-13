@@ -1,0 +1,12 @@
+node_modules
+dist
+logs
+.env
+.env.local
+.next
+coverage
+*.log
+codex.md 
+AuditLog_Detailed.md
+AuditLog_MasterContext.md
+

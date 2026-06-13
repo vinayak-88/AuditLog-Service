@@ -1,0 +1,116 @@
+import 'dotenv/config';
+import cors from 'cors';
+import express from 'express';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import appsRouter from './routes/apps';
+import eventsRouter from './routes/events';
+import exportRouter from './routes/export';
+import healthRouter from './routes/health';
+import searchRouter from './routes/search';
+import verifyRouter from './routes/verify';
+import { apiKeyAuth } from './middleware/auth';
+import { errorHandler } from './middleware/errorHandler';
+import { requestId } from './middleware/requestId';
+import logger from './config/logger';
+import prisma from './config/db';
+import redis from './config/redis';
+
+export function createApp() {
+  const app = express();
+
+  app.use(
+    cors({
+      origin: [process.env.NEXTAUTH_URL || 'http://localhost:3001'],
+      methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+      /*
+       * CHANGED: allow browser clients to send x-request-id on CORS preflight.
+       *
+       * The request-id middleware already propagates upstream correlation IDs,
+       * but browsers will not send that header cross-origin unless CORS permits
+       * it explicitly.
+       */
+      allowedHeaders: ['Content-Type', 'Authorization', 'x-owner-id', 'x-user-id', 'x-request-id'],
+      /*
+       * CHANGED: expose x-request-id so browser clients can read the response
+       * correlation ID and include it in their own error reporting.
+       */
+      exposedHeaders: ['x-request-id'],
+      credentials: true
+    })
+  );
+
+  app.use(requestId);
+  app.use(helmet());
+  
+  app.use(express.json({ limit: '1mb' }));
+  app.use(
+    /*
+     * CHANGED: include x-request-id in every Morgan access log line so the
+     * correlation ID assigned above is visible in request-level logging.
+     */
+    morgan(':req[x-request-id] :remote-addr - :remote-user [:date[clf]] ":method :url HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent"', {
+      stream: { write: (message) => logger.info(message.trim()) },
+      skip: (req) => req.path === '/health'
+    })
+  );
+
+  app.use('/health', healthRouter);
+  /*
+   * CHANGED: all public API routes except /health are mounted under /v1.
+   *
+   * Versioning the route surface now gives future breaking API changes a clean
+   * migration path while preserving the unversioned health check for platform
+   * probes. The apiKeyAuth middleware remains below dashboard-facing /v1/apps and
+   * above the protected event, verification, and export routes.
+   */
+  app.use('/v1/apps', appsRouter);
+
+  app.use(apiKeyAuth);
+  app.use('/v1/events', eventsRouter);
+  app.use('/v1/events', searchRouter);
+  app.use('/v1/verify', verifyRouter);
+  app.use('/v1/export', exportRouter);
+
+  app.use((_req, res) => {
+    res.status(404).json({
+      success: false,
+      error: { message: 'Route not found', code: 'NOT_FOUND', statusCode: 404 }
+    });
+  });
+
+  app.use(errorHandler);
+
+  return app;
+}
+
+const app = createApp();
+
+if (require.main === module) {
+  const PORT = Number.parseInt(process.env.PORT || '3000', 10);
+  const server = app.listen(PORT, () => {
+    logger.info(`API server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
+  });
+
+  async function shutdown(signal: string) {
+    logger.info(`${signal} received; starting graceful shutdown`);
+
+    server.closeAllConnections();
+    server.close(async () => {
+      logger.info('HTTP server closed');
+      await prisma.$disconnect();
+      redis.disconnect();
+      process.exit(0);
+    });
+
+    setTimeout(() => {
+      logger.error('Graceful shutdown timeout; forcing exit');
+      process.exit(1);
+    }, 10000).unref();
+  }
+
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+}
+
+export default app;

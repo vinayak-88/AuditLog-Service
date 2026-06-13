@@ -1,0 +1,56 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model App {
+  id          String     @id @default(cuid())
+  name        String
+  description String?
+  apiKey      String     @unique
+  ownerId     String
+  isActive    Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  auditLogs   AuditLog[]
+
+  @@index([ownerId])
+  @@map("apps")
+}
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  appId          String
+  actorId        String
+  actorType      String
+  action         String
+  resourceId     String
+  resourceType   String
+  metadata       Json?
+  ipAddress      String?
+  userAgent      String?
+  /// CHANGED: stores optional client idempotency keys used by events.ts to
+  /// deduplicate safe HTTP retries for the same app.
+  idempotencyKey String?
+  entryHash      String
+  previousHash   String
+  sequenceNumber Int
+  createdAt      DateTime @default(now())
+
+  app            App      @relation(fields: [appId], references: [id])
+
+  @@unique([appId, sequenceNumber])
+  /// CHANGED: makes the idempotency guarantee safe under concurrent requests by
+  /// allowing only one row for a given app/key pair while permitting many nulls.
+  @@unique([appId, idempotencyKey], name: "unique_app_idempotency_key")
+  @@index([appId, createdAt])
+  @@index([appId, actorId])
+  @@index([appId, resourceId])
+  @@index([appId, action])
+  @@map("audit_logs")
+}
