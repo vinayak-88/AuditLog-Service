@@ -72,7 +72,7 @@ export const IngestEventSchema = z.object({
   idempotencyKey: z.string().min(1).max(255).optional()
 });
 
-export const SearchEventsSchema = z.object({
+const SearchEventsBaseSchema = z.object({
   actorId: z.string().optional(),
   actorType: z.string().optional(),
   action: z.string().optional(),
@@ -80,12 +80,36 @@ export const SearchEventsSchema = z.object({
   resourceType: z.string().optional(),
   startDate: z.string().datetime().optional(),
   endDate: z.string().datetime().optional(),
-  page: z.coerce.number().int().positive().default(1),
+  page: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(1000, 'page must not exceed 1000; use date filters or export for deep history')
+    .default(1),
   limit: z.coerce.number().int().min(1).max(100).default(50)
 });
 
-export const ExportEventsSchema = SearchEventsSchema.extend({
+function isValidDateRange(data: { startDate?: string; endDate?: string }): boolean {
+  if (data.startDate && data.endDate) {
+    const start = new Date(data.startDate);
+    const end = new Date(data.endDate);
+    if (end < start) return false;
+    const MAX_RANGE_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+    if (end.getTime() - start.getTime() > MAX_RANGE_MS) return false;
+  }
+  return true;
+}
+
+const DATE_RANGE_MESSAGE = 'endDate must be after startDate and the date range must not exceed 90 days';
+
+export const SearchEventsSchema = SearchEventsBaseSchema.refine(isValidDateRange, {
+  message: DATE_RANGE_MESSAGE
+});
+
+export const ExportEventsSchema = SearchEventsBaseSchema.extend({
   format: z.enum(['json', 'csv']).default('json')
+}).refine(isValidDateRange, {
+  message: DATE_RANGE_MESSAGE
 });
 
 export const RegisterAppSchema = z.object({

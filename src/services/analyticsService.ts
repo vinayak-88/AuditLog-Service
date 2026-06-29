@@ -1,4 +1,32 @@
 import prisma from '../config/db';
+import redis from '../config/redis';
+import logger from '../config/logger';
+
+const VOLUME_WINDOW_DAYS = Number.parseInt(process.env.ANALYTICS_VOLUME_WINDOW_DAYS || '30', 10);
+const ACTOR_BREAKDOWN_WINDOW_DAYS = Number.parseInt(process.env.ANALYTICS_ACTOR_WINDOW_DAYS || '7', 10);
+const ACTION_BREAKDOWN_WINDOW_DAYS = Number.parseInt(process.env.ANALYTICS_ACTION_WINDOW_DAYS || '7', 10);
+const ANALYTICS_CACHE_TTL_SECONDS = Number.parseInt(process.env.ANALYTICS_CACHE_TTL_SECONDS || '60', 10);
+
+async function withAnalyticsCache<T>(cacheKey: string, compute: () => Promise<T>): Promise<T> {
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached) as T;
+    }
+  } catch (err) {
+    logger.warn({ message: 'Unable to read analytics cache; falling back to direct query', cacheKey, error: err });
+  }
+
+  const result = await compute();
+
+  try {
+    await redis.set(cacheKey, JSON.stringify(result), 'EX', ANALYTICS_CACHE_TTL_SECONDS);
+  } catch (err) {
+    logger.warn({ message: 'Unable to write analytics cache', cacheKey, error: err });
+  }
+
+  return result;
+}
 
 export async function getTotalEventCount(appId: string): Promise<number> {
   return prisma.auditLog.count({ where: { appId } });
@@ -44,54 +72,68 @@ export async function getTotalEventCount(appId: string): Promise<number> {
  *   you have bigger problems than this line.
  */
 export async function getEventVolumeByDay(appId: string): Promise<{ date: string; count: number }[]> {
-  const rows = await prisma.$queryRaw<Array<{ date: string; count: bigint }>>`
-    SELECT
-      DATE_TRUNC('day', created_at)::date::text AS date,
-      COUNT(*)                                   AS count
-    FROM audit_logs
-    WHERE app_id   = ${appId}
-      AND created_at >= NOW() - INTERVAL '30 days'
-    GROUP BY DATE_TRUNC('day', created_at)
-    ORDER BY DATE_TRUNC('day', created_at) ASC
-  `;
+  return withAnalyticsCache(`analytics:volume:${appId}`, async () => {
+    const cutoff = new Date(Date.now() - VOLUME_WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
-  /*
-   * BigInt -> number conversion here rather than in the template so the public
-   * return type stays as { date: string; count: number }[] without any change
-   * to callers.
-   */
-  return rows.map((row) => ({
-    date: row.date,
-    count: Number(row.count)
-  }));
+    const rows = await prisma.$queryRaw<Array<{ date: string; count: bigint }>>`
+      SELECT
+        DATE_TRUNC('day', created_at)::date::text AS date,
+        COUNT(*)                                   AS count
+      FROM audit_logs
+      WHERE app_id   = ${appId}
+        AND created_at >= ${cutoff}
+      GROUP BY DATE_TRUNC('day', created_at)
+      ORDER BY DATE_TRUNC('day', created_at) ASC
+    `;
+
+    /*
+     * BigInt -> number conversion here rather than in the template so the public
+     * return type stays as { date: string; count: number }[] without any change
+     * to callers.
+     */
+    return rows.map((row) => ({
+      date: row.date,
+      count: Number(row.count)
+    }));
+  });
 }
 
 export async function getTopActors(appId: string): Promise<{ actorId: string; actorType: string; count: number }[]> {
-  const grouped = await prisma.auditLog.groupBy({
-    by: ['actorId', 'actorType'],
-    where: { appId, createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } },
-    _count: { _all: true },
-    orderBy: { _count: { actorId: 'desc' } },
-    take: 10
-  });
+  return withAnalyticsCache(`analytics:top-actors:${appId}`, async () => {
+    const grouped = (await (prisma.auditLog.groupBy as any)({
+      by: ['actorId', 'actorType'],
+      where: {
+        appId,
+        createdAt: { gte: new Date(Date.now() - ACTOR_BREAKDOWN_WINDOW_DAYS * 24 * 60 * 60 * 1000) }
+      },
+      _count: { _all: true },
+      orderBy: { _count: { _all: 'desc' } },
+      take: 10
+    })) as Array<{ actorId: string; actorType: string; _count: { _all: number } }>;
 
-  return grouped.map((row) => ({
-    actorId: row.actorId,
-    actorType: row.actorType,
-    count: row._count._all
-  }));
+    return grouped.map((row) => ({
+      actorId: row.actorId,
+      actorType: row.actorType,
+      count: row._count._all
+    }));
+  });
 }
 
 export async function getActionBreakdown(appId: string): Promise<{ action: string; count: number }[]> {
-  const grouped = await prisma.auditLog.groupBy({
-    by: ['action'],
-    where: { appId, createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } },
-    _count: { _all: true },
-    orderBy: { _count: { action: 'desc' } },
-    take: 20
-  });
+  return withAnalyticsCache(`analytics:action-breakdown:${appId}`, async () => {
+    const grouped = await prisma.auditLog.groupBy({
+      by: ['action'],
+      where: {
+        appId,
+        createdAt: { gte: new Date(Date.now() - ACTION_BREAKDOWN_WINDOW_DAYS * 24 * 60 * 60 * 1000) }
+      },
+      _count: { _all: true },
+      orderBy: { _count: { action: 'desc' } },
+      take: 20
+    });
 
-  return grouped.map((row) => ({ action: row.action, count: row._count._all }));
+    return grouped.map((row) => ({ action: row.action, count: row._count._all }));
+  });
 }
 
 export async function getEventsLast24Hours(appId: string): Promise<number> {

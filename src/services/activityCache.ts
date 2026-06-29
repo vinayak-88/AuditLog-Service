@@ -38,6 +38,44 @@ export async function cacheActivityEntry(appId: string, entry: ActivityEntry): P
   }
 }
 
+export async function bulkCacheActivityEntries(
+  appId: string,
+  resourceId: string,
+  entries: ActivityEntry[]
+): Promise<void> {
+  if (entries.length === 0) return;
+
+  try {
+    const key = getCacheKey(appId, resourceId);
+    const pipeline = redis.pipeline();
+
+    for (const entry of entries) {
+      const score = new Date(entry.createdAt).getTime();
+      const member = JSON.stringify(entry);
+      pipeline.zadd(key, score, member);
+    }
+
+    // Trim to MAX_ENTRIES and reset TTL once after all ZADDs
+    pipeline.zremrangebyrank(key, 0, -(MAX_ENTRIES + 1));
+    pipeline.expire(key, TTL_SECONDS);
+
+    const results = await pipeline.exec();
+    if (results) {
+      results.forEach(([err], i) => {
+        if (err) {
+          logger.warn({
+            message: 'Redis bulk activity cache pipeline command failed',
+            commandIndex: i,
+            error: err.message
+          });
+        }
+      });
+    }
+  } catch (err) {
+    logger.warn({ message: 'Unable to bulk-warm Redis activity cache', error: err });
+  }
+}
+
 export async function getActivityFeed(
   appId: string,
   resourceId: string,
@@ -96,12 +134,7 @@ export async function getActivityFeed(
   }));
 
   // Warm Redis cache from PostgreSQL result - best effort.
-  Promise.all(entries.map((entry) => cacheActivityEntry(appId, entry))).catch((err) =>
-    logger.warn({
-      message: 'Failed to warm activity cache from PostgreSQL fallback',
-      error: err
-    })
-  );
+  void bulkCacheActivityEntries(appId, resourceId, entries);
 
   return { entries, source: 'database' };
 }

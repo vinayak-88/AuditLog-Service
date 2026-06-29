@@ -1,9 +1,11 @@
 import { randomBytes } from 'crypto';
 import type { Request } from 'express';
 import { Router } from 'express';
+import { z } from 'zod';
 import { asyncHandler } from '../middleware/asyncHandler';
 import { clearApiKeyCache, getDashboardOwnerId } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
+import { appsRateLimiter } from '../middleware/rateLimiter';
 import { validateBody } from '../middleware/validateBody';
 import prisma from '../config/db';
 import { RegisterAppSchema } from '../types';
@@ -57,6 +59,7 @@ router.get(
 
 router.post(
   '/',
+  appsRateLimiter,
   validateBody(RegisterAppSchema),
   asyncHandler(async (req, res) => {
     const ownerId = requireOwnerId(req);
@@ -88,9 +91,10 @@ router.post(
 
 router.post(
   '/:id/rotate-key',
+  appsRateLimiter,
   asyncHandler(async (req, res) => {
     const ownerId = requireOwnerId(req);
-    const appId = String(req.params.id);
+    const appId = z.string().cuid().parse(req.params.id);
     const app = await prisma.app.findFirst({ where: { id: appId, ownerId } });
 
     if (!app) {
@@ -109,9 +113,10 @@ router.post(
 
 router.delete(
   '/:id',
+  appsRateLimiter,
   asyncHandler(async (req, res) => {
     const ownerId = requireOwnerId(req);
-    const appId = String(req.params.id);
+    const appId = z.string().cuid().parse(req.params.id);
     const app = await prisma.app.findFirst({ where: { id: appId, ownerId } });
 
     if (!app) {

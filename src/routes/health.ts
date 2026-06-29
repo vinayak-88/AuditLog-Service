@@ -4,11 +4,21 @@ import prisma from '../config/db';
 import redis from '../config/redis';
 
 const router = Router();
+const HEALTH_TIMEOUT_MS = 3000;
+
+function withTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} health check timed out after ${HEALTH_TIMEOUT_MS}ms`)), HEALTH_TIMEOUT_MS)
+    )
+  ]);
+}
 
 router.get(
   '/',
   asyncHandler(async (_req, res) => {
-    const dependencies = {
+    const dependencies: Record<string, string> = {
       postgresql: 'connected',
       redis: 'connected'
     };
@@ -16,14 +26,14 @@ router.get(
     let healthy = true;
 
     try {
-      await prisma.$queryRaw`SELECT 1`;
+      await withTimeout(prisma.$queryRaw`SELECT 1`, 'PostgreSQL');
     } catch (err) {
       healthy = false;
       dependencies.postgresql = `error: ${err instanceof Error ? err.message : 'unknown'}`;
     }
 
     try {
-      await redis.ping();
+      await withTimeout(redis.ping(), 'Redis');
     } catch (err) {
       healthy = false;
       dependencies.redis = `error: ${err instanceof Error ? err.message : 'unknown'}`;

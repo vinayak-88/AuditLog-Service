@@ -2,20 +2,29 @@ import { createHmac, timingSafeEqual } from 'crypto';
 import prisma from '../config/db';
 import type { HashPayload, VerificationResult } from '../types';
 
-if (!process.env.HASH_SECRET) {
-  const env = process.env.NODE_ENV;
-  if (env !== 'development' && env !== 'test') {
-    throw new Error(`HASH_SECRET environment variable must be set (current NODE_ENV: ${env ?? 'undefined'})`);
-  }
-}
-
-const HASH_SECRET = process.env.HASH_SECRET || 'development-only-hash-secret';
-export const GENESIS_HASH = process.env.GENESIS_HASH || 'audit-log-genesis';
+const HASH_SECRET = process.env.HASH_SECRET as string;
+export const GENESIS_HASH = process.env.GENESIS_HASH as string;
 const VERIFY_CHAIN_BATCH_SIZE = Number.parseInt(process.env.VERIFY_CHAIN_BATCH_SIZE || '500', 10);
 
 export function computeEntryHash(previousHash: string, payload: HashPayload): string {
   const input = previousHash + JSON.stringify(payload);
   return createHmac('sha256', HASH_SECRET).update(input).digest('hex');
+}
+
+function canonicalizeJson(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(canonicalizeJson);
+  }
+  const record = value as Record<string, unknown>;
+  return Object.keys(record)
+    .sort()
+    .reduce<Record<string, unknown>>((acc, key) => {
+      acc[key] = canonicalizeJson(record[key]);
+      return acc;
+    }, {});
 }
 
 export function buildHashPayload(entry: {
@@ -37,7 +46,7 @@ export function buildHashPayload(entry: {
     action: entry.action,
     resourceId: entry.resourceId,
     resourceType: entry.resourceType,
-    metadata: entry.metadata,
+    metadata: canonicalizeJson(entry.metadata) as Record<string, unknown> | null,
     createdAt: entry.createdAt.toISOString()
   };
 }

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { asyncHandler } from '../middleware/asyncHandler';
+import { exportRateLimiter } from '../middleware/rateLimiter';
 import { validateQuery } from '../middleware/validateQuery';
 import prisma from '../config/db';
 import { ExportEventsSchema, type ExportEventsInput } from '../types';
@@ -27,12 +28,19 @@ const JSON_EXPORT_MAX_ROWS = Number.parseInt(process.env.JSON_EXPORT_MAX_ROWS ||
 
 function escapeCsv(value: unknown): string {
   if (value === null || value === undefined) return '';
-  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  let text = typeof value === 'string' ? value : JSON.stringify(value);
+  // Prevent CSV/formula injection: Excel and Google Sheets treat leading
+  // =, +, -, or @ as the start of a formula. Prefixing with a single quote
+  // neutralizes it without changing the visible value when opened.
+  if (/^[=+\-@]/.test(text)) {
+    text = `'${text}`;
+  }
   return `"${text.replace(/"/g, '""')}"`;
 }
 
 router.get(
   '/',
+  exportRateLimiter,
   validateQuery(ExportEventsSchema),
   asyncHandler(async (req, res) => {
     const app = req.auditApp!;
@@ -146,58 +154,49 @@ router.get(
     let truncated = false;
 
     while (true) {
-      /*
-       * Respect the per-batch size but also never exceed the overall cap.
-       * If we're near the cap, take only what we have left so we don't
-       * overshoot by a full batch.
-       */
       const remaining = JSON_EXPORT_MAX_ROWS - totalFetched;
       if (remaining <= 0) {
         truncated = true;
         break;
       }
 
+      // Over-fetch by one row beyond what's needed to fill the cap. If the
+      // extra row comes back, there is more data beyond the cap and we should
+      // report truncated: true. If it doesn't, we've reached the real end of
+      // the dataset exactly at the cap, and truncated should stay false.
+      const takeWithLookahead = Math.min(BATCH_SIZE, remaining) + 1;
+
       const events = await prisma.auditLog.findMany({
         where,
-        /*
-         * CHANGED: JSON export uses the same chronological ordering as CSV.
-         *
-         * Cursor pagination still works the same way; the cursor points to the
-         * last row returned in whichever direction the result set is sorted.
-         */
         orderBy: { createdAt: 'asc' },
-        take: Math.min(BATCH_SIZE, remaining),
+        take: takeWithLookahead,
         ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
         select: eventPublicSelect
       });
 
       if (events.length === 0) break;
 
-      for (const event of events) {
-        /*
-         * Write comma separator before every element except the first.
-         * This avoids a trailing comma which would make the JSON invalid.
-         */
+      const hitCap = totalFetched + events.length > JSON_EXPORT_MAX_ROWS;
+      const toWrite = hitCap ? events.slice(0, JSON_EXPORT_MAX_ROWS - totalFetched) : events;
+
+      for (const event of toWrite) {
         if (!isFirst) res.write(',');
         res.write(JSON.stringify({ ...event, createdAt: event.createdAt.toISOString() }));
         isFirst = false;
       }
 
-      totalFetched += events.length;
-      cursor = events.at(-1)?.id;
+      totalFetched += toWrite.length;
 
-      /*
-       * If the batch came back smaller than requested, we've exhausted the
-       * result set. No need to make another round-trip to confirm.
-       */
-      if (events.length < Math.min(BATCH_SIZE, remaining)) break;
+      if (hitCap) {
+        truncated = true;
+        break;
+      }
+
+      cursor = toWrite.at(-1)?.id;
+
+      if (events.length < takeWithLookahead) break;
     }
 
-    /*
-     * Close the JSON envelope. Include `truncated` so callers can detect
-     * that they didn't receive the full dataset and should switch to CSV
-     * if they need everything.
-     */
     res.write(`],"truncated":${truncated},"totalFetched":${totalFetched}}}`);
     return res.end();
   })

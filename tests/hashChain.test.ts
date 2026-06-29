@@ -117,6 +117,48 @@ describe('hash chain service', () => {
       });
     });
 
+    it('returns valid when metadata contains objects nested inside arrays', async () => {
+      await prisma.app.create({
+        data: { id: appId, name: 'Hash Test App', ownerId: 'owner_1', apiKey: 'hash-test-key' }
+      });
+
+      const createdAt = new Date('2026-04-24T10:00:01.000Z');
+      const metadata = { items: [{ b: 1, a: 2 }] };
+      const payload = buildHashPayload({
+        appId,
+        sequenceNumber: 1,
+        actorId: 'user_1',
+        actorType: 'user',
+        action: 'invoice.updated',
+        resourceId: 'invoice_1',
+        resourceType: 'invoice',
+        metadata,
+        createdAt
+      });
+      const entryHash = computeEntryHash(GENESIS_HASH, payload);
+
+      await prisma.auditLog.create({
+        data: {
+          appId,
+          actorId: 'user_1',
+          actorType: 'user',
+          action: 'invoice.updated',
+          resourceId: 'invoice_1',
+          resourceType: 'invoice',
+          metadata,
+          previousHash: GENESIS_HASH,
+          entryHash,
+          sequenceNumber: 1,
+          createdAt
+        }
+      });
+
+      await expect(verifyChain(appId)).resolves.toMatchObject({
+        valid: true,
+        entriesChecked: 1
+      });
+    });
+
     it('detects a tampered entry 3 of 5 and reports the sequence number', async () => {
       await createFiveEntryChain();
 

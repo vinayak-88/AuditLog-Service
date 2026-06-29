@@ -2,6 +2,7 @@ import type { Prisma } from '@prisma/client';
 import { Router } from 'express';
 import { z } from 'zod';
 import { asyncHandler } from '../middleware/asyncHandler';
+import { searchRateLimiter } from '../middleware/rateLimiter';
 import { validateQuery } from '../middleware/validateQuery';
 import { getActivityFeed } from '../services/activityCache';
 import prisma from '../config/db';
@@ -65,6 +66,7 @@ export const eventPublicSelect = {
 
 router.get(
   '/',
+  searchRateLimiter,
   validateQuery(SearchEventsSchema),
   asyncHandler(async (req, res) => {
     const app = req.auditApp!;
@@ -107,6 +109,7 @@ router.get(
 
 router.get(
   '/activity/:resourceId',
+  searchRateLimiter,
   validateQuery(ActivityQuerySchema),
   asyncHandler(async (req, res) => {
     const app = req.auditApp!;

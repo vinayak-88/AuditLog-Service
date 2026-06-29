@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import type { NextFunction, Request, Response } from 'express';
 import prisma from '../config/db';
 import logger from '../config/logger';
@@ -7,8 +8,12 @@ const API_KEY_CACHE_TTL_SECONDS = Number.parseInt(process.env.API_KEY_CACHE_TTL_
 const SHOULD_USE_API_KEY_CACHE =
   process.env.NODE_ENV !== 'test' || process.env.ENABLE_API_KEY_CACHE_IN_TESTS === 'true';
 
+function hashKeyForCache(rawKey: string): string {
+  return createHash('sha256').update(rawKey).digest('hex');
+}
+
 function getApiKeyCacheKey(apiKey: string): string {
-  return `apikey:${apiKey}`;
+  return `apikey:${hashKeyForCache(apiKey)}`;
 }
 
 export async function clearApiKeyCache(apiKey: string): Promise<void> {
@@ -131,7 +136,13 @@ export function getDashboardOwnerId(req: Request): string | null {
    * The x-owner-id / x-user-id headers identify which user's apps to scope to.
    */
   if (internalKey && token === internalKey) {
-    return req.header('x-owner-id') ?? req.header('x-user-id') ?? 'dashboard-dev-user';
+    const ownerId = req.header('x-owner-id') ?? req.header('x-user-id') ?? null;
+    if (!ownerId) {
+      logger.warn({
+        message: 'INTERNAL_API_KEY authenticated request missing x-owner-id and x-user-id headers - rejecting'
+      });
+    }
+    return ownerId;
   }
 
   /*

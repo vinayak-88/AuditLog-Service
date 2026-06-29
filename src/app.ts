@@ -12,6 +12,7 @@ import verifyRouter from './routes/verify';
 import { apiKeyAuth } from './middleware/auth';
 import { errorHandler } from './middleware/errorHandler';
 import { requestId } from './middleware/requestId';
+import { validateEnv } from './config/validateEnv';
 import logger from './config/logger';
 import prisma from './config/db';
 import redis from './config/redis';
@@ -19,9 +20,13 @@ import redis from './config/redis';
 export function createApp() {
   const app = express();
 
+  app.use(helmet());
   app.use(
     cors({
-      origin: [process.env.NEXTAUTH_URL || 'http://localhost:3001'],
+      origin: (process.env.CORS_ORIGINS ?? process.env.NEXTAUTH_URL ?? 'http://localhost:3001')
+        .split(',')
+        .map((o) => o.trim())
+        .filter(Boolean),
       methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
       /*
        * CHANGED: allow browser clients to send x-request-id on CORS preflight.
@@ -41,8 +46,6 @@ export function createApp() {
   );
 
   app.use(requestId);
-  app.use(helmet());
-  
   app.use(express.json({ limit: '1mb' }));
   app.use(
     /*
@@ -87,6 +90,7 @@ export function createApp() {
 const app = createApp();
 
 if (require.main === module) {
+  validateEnv();
   const PORT = Number.parseInt(process.env.PORT || '3000', 10);
   const server = app.listen(PORT, () => {
     logger.info(`API server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
@@ -111,6 +115,15 @@ if (require.main === module) {
 
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('unhandledRejection', (reason: unknown) => {
+    logger.error({ message: 'Unhandled promise rejection - shutting down', reason });
+    void shutdown('unhandledRejection');
+  });
+
+  process.on('uncaughtException', (err: Error) => {
+    logger.error({ message: 'Uncaught exception - shutting down', error: err.message, stack: err.stack });
+    void shutdown('uncaughtException');
+  });
 }
 
 export default app;

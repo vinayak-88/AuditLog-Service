@@ -7,22 +7,33 @@ import { sendTamperAlert } from '../services/alertService';
 import { verifyChain } from '../services/hashChain';
 import redis from '../config/redis';
 import logger from '../config/logger';
-import type { VerificationResult } from '../types';
 
 const router = Router();
 const VERIFY_JOB_TTL_SECONDS = Number.parseInt(process.env.VERIFY_JOB_TTL_SECONDS || '3600', 10);
 
-type VerifyJobStatus = 'pending' | 'complete' | 'failed';
+const VerificationResultSchema = z.object({
+  valid: z.boolean(),
+  entriesChecked: z.number(),
+  durationMs: z.number(),
+  tamperedAt: z
+    .object({
+      sequenceNumber: z.number(),
+      entryId: z.string()
+    })
+    .optional()
+});
 
-interface VerifyJob {
-  jobId: string;
-  appId: string;
-  status: VerifyJobStatus;
-  startedAt: string;
-  completedAt?: string;
-  result?: VerificationResult;
-  error?: string;
-}
+const VerifyJobSchema = z.object({
+  jobId: z.string().uuid(),
+  appId: z.string(),
+  status: z.enum(['pending', 'complete', 'failed']),
+  startedAt: z.string(),
+  completedAt: z.string().optional(),
+  result: VerificationResultSchema.optional(),
+  error: z.string().optional()
+});
+
+type VerifyJob = z.infer<typeof VerifyJobSchema>;
 
 function getVerifyJobKey(appId: string, jobId: string): string {
   return `verify-job:${appId}:${jobId}`;
@@ -82,6 +93,55 @@ router.post(
   verifyRateLimiter,
   asyncHandler(async (req, res) => {
     const app = req.auditApp!;
+
+    // Check for an already-running job for this app
+    let existingPendingJobId: string | null = null;
+
+    try {
+      let cursor = '0';
+      do {
+        const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', `verify-job:${app.id}:*`, 'COUNT', 20);
+        cursor = nextCursor;
+
+        for (const key of keys) {
+          const raw = await redis.get(key);
+          if (raw) {
+            try {
+              const existing = JSON.parse(raw) as VerifyJob;
+              if (existing.status === 'pending') {
+                existingPendingJobId = existing.jobId;
+                break;
+              }
+            } catch {
+              // malformed entry - ignore
+            }
+          }
+          if (existingPendingJobId) break;
+        }
+      } while (cursor !== '0' && !existingPendingJobId);
+    } catch (err) {
+      logger.warn({
+        message: 'Unable to check for in-flight verification job; proceeding without duplicate check',
+        appId: app.id,
+        error: err
+      });
+    }
+
+    if (existingPendingJobId) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          message: 'A verification job is already running for this app.',
+          code: 'JOB_IN_PROGRESS',
+          statusCode: 409
+        },
+        data: {
+          jobId: existingPendingJobId,
+          pollUrl: `/v1/verify/${existingPendingJobId}`
+        }
+      });
+    }
+
     const jobId = randomUUID();
     const job: VerifyJob = {
       jobId,
@@ -154,10 +214,20 @@ router.get(
       });
     }
 
-    return res.json({
-      success: true,
-      data: JSON.parse(rawJob) as VerifyJob
-    });
+    const parsed = VerifyJobSchema.safeParse(JSON.parse(rawJob));
+    if (!parsed.success) {
+      logger.error({ message: 'Corrupt verify job in Redis', jobId, details: parsed.error.flatten() });
+      return res.status(500).json({
+        success: false,
+        error: {
+          message: 'Verification job data is corrupt. Please start a new job.',
+          code: 'JOB_DATA_CORRUPT',
+          statusCode: 500
+        }
+      });
+    }
+
+    return res.json({ success: true, data: parsed.data });
   })
 );
 

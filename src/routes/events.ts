@@ -4,6 +4,7 @@ import { cacheActivityEntry } from '../services/activityCache';
 import { buildHashPayload, computeEntryHash, GENESIS_HASH } from '../services/hashChain';
 import { eventsRateLimiter } from '../middleware/rateLimiter';
 import { asyncHandler } from '../middleware/asyncHandler';
+import { AppError } from '../middleware/errorHandler';
 import { validateBody } from '../middleware/validateBody';
 import prisma from '../config/db';
 import logger from '../config/logger';
@@ -203,7 +204,11 @@ async function createAuditLogEntry(
     }
   }
 
-  throw new Error('Unable to create audit log entry after retries');
+  throw new AppError(
+    'High write contention - entry could not be committed after 3 attempts. Retry with exponential backoff.',
+    503,
+    'SERVICE_BUSY'
+  );
 }
 
 router.post(
