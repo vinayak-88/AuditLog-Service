@@ -11,7 +11,7 @@ declare global {
        */
       id: string;
       requestId: string;
-      auditApp?: App;
+      auditApp?: Omit<App, 'apiKey'>;
     }
   }
 }

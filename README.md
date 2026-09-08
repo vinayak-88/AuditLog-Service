@@ -15,9 +15,14 @@ docker compose up -d
 npm ci
 npm run prisma:generate
 npm run prisma:migrate
+npm run api-keys:migrate
 npm run build
 npm start
 ```
+
+Run `npm run api-keys:migrate` once during rollout if the database contains
+applications created before API-key digest storage was enabled. It converts
+legacy stored keys in memory and does not print or return them.
 
 The API requires `DATABASE_URL`, `REDIS_HOST`, `REDIS_PORT`, `CORS_ORIGINS`,
 `HASH_SECRET`, `GENESIS_HASH`, and `INTERNAL_API_KEY`.

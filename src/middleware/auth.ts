@@ -1,22 +1,44 @@
-import { createHash } from 'crypto';
 import type { NextFunction, Request, Response } from 'express';
 import prisma from '../config/db';
 import logger from '../config/logger';
 import redis from '../config/redis';
+import { hashApiKey } from '../services/apiKey';
 
 const API_KEY_CACHE_TTL_SECONDS = Number.parseInt(process.env.API_KEY_CACHE_TTL_SECONDS || '600', 10);
 
-function hashKeyForCache(rawKey: string): string {
-  return createHash('sha256').update(rawKey).digest('hex');
+export function getApiKeyCacheKey(rawKey: string): string {
+  return `apikey:${hashApiKey(rawKey)}`;
 }
 
-function getApiKeyCacheKey(apiKey: string): string {
-  return `apikey:${hashKeyForCache(apiKey)}`;
+function getApiKeyCacheKeyFromDigest(apiKeyDigest: string): string {
+  return `apikey:${apiKeyDigest}`;
+}
+
+type CachedApp = Pick<NonNullable<Request['auditApp']>, 'id' | 'name' | 'description' | 'ownerId' | 'isActive' | 'createdAt' | 'updatedAt'>;
+
+function toCachedApp(app: NonNullable<Request['auditApp']>): CachedApp {
+  return {
+    id: app.id,
+    name: app.name,
+    description: app.description,
+    ownerId: app.ownerId,
+    isActive: app.isActive,
+    createdAt: app.createdAt,
+    updatedAt: app.updatedAt
+  };
 }
 
 export async function clearApiKeyCache(apiKey: string): Promise<void> {
   try {
     await redis.del(getApiKeyCacheKey(apiKey));
+  } catch (err) {
+    logger.warn({ message: 'Unable to clear Redis API key cache', error: err });
+  }
+}
+
+export async function clearApiKeyCacheDigest(apiKeyDigest: string): Promise<void> {
+  try {
+    await redis.del(getApiKeyCacheKeyFromDigest(apiKeyDigest));
   } catch (err) {
     logger.warn({ message: 'Unable to clear Redis API key cache', error: err });
   }
@@ -40,9 +62,9 @@ export async function apiKeyAuth(req: Request, res: Response, next: NextFunction
 
     if (cached) {
       const app = JSON.parse(cached);
-      if (!app?.id || !app?.apiKey || !app?.ownerId) {
+      if (!app?.id || !app?.ownerId || app.isActive !== true) {
         logger.warn({
-          message: 'Corrupt or incomplete API key cache entry - evicting and falling back to PostgreSQL',
+          message: 'Corrupt, incomplete, or inactive API key cache entry - evicting and falling back to PostgreSQL',
           cacheKey
         });
         await redis.del(cacheKey).catch(() => {});
@@ -59,9 +81,14 @@ export async function apiKeyAuth(req: Request, res: Response, next: NextFunction
     logger.warn({ message: 'Unable to read Redis API key cache; falling back to PostgreSQL', error: err });
   }
 
-  const app = await prisma.app.findFirst({
-    where: { apiKey, isActive: true }
-  });
+  let app;
+  try {
+    app = await prisma.app.findFirst({
+      where: { apiKey: hashApiKey(apiKey), isActive: true }
+    });
+  } catch (err) {
+    return next(err);
+  }
 
   if (!app) {
     return res.status(401).json({
@@ -71,7 +98,7 @@ export async function apiKeyAuth(req: Request, res: Response, next: NextFunction
   }
 
   try {
-    await redis.set(cacheKey, JSON.stringify(app), 'EX', API_KEY_CACHE_TTL_SECONDS);
+    await redis.set(cacheKey, JSON.stringify(toCachedApp(app)), 'EX', API_KEY_CACHE_TTL_SECONDS);
   } catch (err) {
     logger.warn({ message: 'Unable to write Redis API key cache', error: err });
   }

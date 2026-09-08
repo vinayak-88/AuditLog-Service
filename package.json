@@ -12,6 +12,7 @@
     "lint": "eslint src tests --ext .ts",
     "prisma:migrate": "prisma migrate deploy",
     "prisma:generate": "prisma generate",
+    "api-keys:migrate": "tsx scripts/hash-existing-api-keys.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

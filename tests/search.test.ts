@@ -1,23 +1,28 @@
 import request from 'supertest';
 import app from '../src/app';
 import prisma from '../src/config/db';
+import { clearApiKeyCache } from '../src/middleware/auth';
+import redis from '../src/config/redis';
+import { hashApiKey } from '../src/services/apiKey';
 
 describe('GET /events', () => {
   const apiKey = 'search-test-key';
 
   beforeEach(async () => {
+    await clearApiKeyCache(apiKey);
     await prisma.$executeRawUnsafe('ALTER TABLE audit_logs DISABLE TRIGGER audit_log_immutable').catch(() => undefined);
     await prisma.auditLog.deleteMany({});
     await prisma.app.deleteMany({});
     await prisma.$executeRawUnsafe('ALTER TABLE audit_logs ENABLE TRIGGER audit_log_immutable').catch(() => undefined);
     await prisma.app.create({
-      data: { name: 'Search Test App', ownerId: 'owner_1', apiKey }
+      data: { name: 'Search Test App', ownerId: 'owner_1', apiKey: hashApiKey(apiKey) }
     });
   });
 
   afterAll(async () => {
-    await prisma.$disconnect();
-  });
+  await prisma.$disconnect();
+  await redis.quit();
+});
 
   it('returns filtered events without hash fields', async () => {
     await request(app).post('/v1/events').set('Authorization', `Bearer ${apiKey}`).send({

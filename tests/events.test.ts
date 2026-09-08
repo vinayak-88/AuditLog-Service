@@ -2,23 +2,28 @@ import request from 'supertest';
 import app from '../src/app';
 import prisma from '../src/config/db';
 import { GENESIS_HASH } from '../src/services/hashChain';
+import { clearApiKeyCache } from '../src/middleware/auth';
+import redis from '../src/config/redis';
+import { hashApiKey } from '../src/services/apiKey';
 
 describe('POST /events', () => {
   const apiKey = 'events-test-key';
 
   beforeEach(async () => {
+    await clearApiKeyCache(apiKey);
     await prisma.$executeRawUnsafe('ALTER TABLE audit_logs DISABLE TRIGGER audit_log_immutable').catch(() => undefined);
     await prisma.auditLog.deleteMany({});
     await prisma.app.deleteMany({});
     await prisma.$executeRawUnsafe('ALTER TABLE audit_logs ENABLE TRIGGER audit_log_immutable').catch(() => undefined);
     await prisma.app.create({
-      data: { name: 'Events Test App', ownerId: 'owner_1', apiKey }
+      data: { name: 'Events Test App', ownerId: 'owner_1', apiKey: hashApiKey(apiKey) }
     });
   });
 
   afterAll(async () => {
-    await prisma.$disconnect();
-  });
+  await prisma.$disconnect();
+  await redis.quit();
+});
 
   it('accepts a valid event and creates the first chain link', async () => {
     const response = await request(app)

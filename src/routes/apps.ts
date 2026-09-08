@@ -3,12 +3,13 @@ import type { Request } from 'express';
 import { Router } from 'express';
 import { z } from 'zod';
 import { asyncHandler } from '../middleware/asyncHandler';
-import { clearApiKeyCache, getDashboardOwnerId } from '../middleware/auth';
+import { clearApiKeyCacheDigest, getDashboardOwnerId } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
 import { appsRateLimiter } from '../middleware/rateLimiter';
 import { validateBody } from '../middleware/validateBody';
 import prisma from '../config/db';
 import { RegisterAppSchema } from '../types';
+import { hashApiKey } from '../services/apiKey';
 
 const router = Router();
 
@@ -63,12 +64,13 @@ router.post(
   validateBody(RegisterAppSchema),
   asyncHandler(async (req, res) => {
     const ownerId = requireOwnerId(req);
+    const apiKey = createApiKey();
     const app = await prisma.app.create({
       data: {
         ownerId,
         name: req.body.name,
         description: req.body.description ?? null,
-        apiKey: createApiKey()
+        apiKey: hashApiKey(apiKey)
       }
     });
 
@@ -78,11 +80,7 @@ router.post(
         id: app.id,
         name: app.name,
         description: app.description,
-        // PORTFOLIO SIMPLIFICATION: API keys are stored as plaintext.
-        // Production systems should store only a SHA-256 hash (with a pepper)
-        // and never return the plaintext after initial creation.
-        // The full key is returned once here and never stored in a retrievable form.
-        apiKey: app.apiKey,
+        apiKey,
         createdAt: app.createdAt.toISOString()
       }
     });
@@ -94,20 +92,21 @@ router.post(
   appsRateLimiter,
   asyncHandler(async (req, res) => {
     const ownerId = requireOwnerId(req);
-    const appId = z.string().cuid().parse(req.params.id);
+    const appId = z.string().uuid().parse(req.params.id);
     const app = await prisma.app.findFirst({ where: { id: appId, ownerId } });
 
     if (!app) {
       throw new AppError('App not found', 404, 'APP_NOT_FOUND');
     }
 
-    const updated = await prisma.app.update({
+    const newApiKey = createApiKey();
+    await prisma.app.update({
       where: { id: app.id },
-      data: { apiKey: createApiKey() }
+      data: { apiKey: hashApiKey(newApiKey) }
     });
-    await clearApiKeyCache(app.apiKey);
+    await clearApiKeyCacheDigest(app.apiKey);
 
-    return res.json({ success: true, data: { newApiKey: updated.apiKey } });
+    return res.json({ success: true, data: { newApiKey } });
   })
 );
 
@@ -116,7 +115,7 @@ router.delete(
   appsRateLimiter,
   asyncHandler(async (req, res) => {
     const ownerId = requireOwnerId(req);
-    const appId = z.string().cuid().parse(req.params.id);
+    const appId = z.string().uuid().parse(req.params.id);
     const app = await prisma.app.findFirst({ where: { id: appId, ownerId } });
 
     if (!app) {
@@ -124,7 +123,7 @@ router.delete(
     }
 
     await prisma.app.update({ where: { id: app.id }, data: { isActive: false } });
-    await clearApiKeyCache(app.apiKey);
+    await clearApiKeyCacheDigest(app.apiKey);
     return res.status(204).send();
   })
 );

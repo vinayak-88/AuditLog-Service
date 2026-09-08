@@ -1,6 +1,9 @@
 import request from 'supertest';
 import app from '../src/app';
 import prisma from '../src/config/db';
+import { clearApiKeyCache } from '../src/middleware/auth';
+import redis from '../src/config/redis';
+import { hashApiKey } from '../src/services/apiKey';
 
 describe('POST /v1/verify', () => {
   const apiKey = 'verify-test-key';
@@ -16,18 +19,20 @@ describe('POST /v1/verify', () => {
   }
 
   beforeEach(async () => {
+    await clearApiKeyCache(apiKey);
     await prisma.$executeRawUnsafe('ALTER TABLE audit_logs DISABLE TRIGGER audit_log_immutable').catch(() => undefined);
     await prisma.auditLog.deleteMany({});
     await prisma.app.deleteMany({});
     await prisma.$executeRawUnsafe('ALTER TABLE audit_logs ENABLE TRIGGER audit_log_immutable').catch(() => undefined);
     await prisma.app.create({
-      data: { name: 'Verify Test App', ownerId: 'owner_1', apiKey }
+      data: { name: 'Verify Test App', ownerId: 'owner_1', apiKey: hashApiKey(apiKey) }
     });
   });
 
   afterAll(async () => {
-    await prisma.$disconnect();
-  });
+  await prisma.$disconnect();
+  await redis.quit();
+});
 
   it('returns valid for an unmodified chain', async () => {
     const eventResponse = await request(app).post('/v1/events').set('Authorization', `Bearer ${apiKey}`).send({

@@ -1,8 +1,10 @@
 import { buildHashPayload, computeEntryHash, GENESIS_HASH, verifyChain } from '../src/services/hashChain';
 import prisma from '../src/config/db';
+import { randomUUID } from 'crypto';
+import { hashApiKey } from '../src/services/apiKey';
 
 describe('hash chain service', () => {
-  const appId = 'test_app_hash_chain';
+  const appId = randomUUID();
 
   afterAll(async () => {
     await prisma.$disconnect();
@@ -43,7 +45,7 @@ describe('hash chain service', () => {
   describe('database verification', () => {
     async function createFiveEntryChain() {
       await prisma.app.create({
-        data: { id: appId, name: 'Hash Test App', ownerId: 'owner_1', apiKey: 'hash-test-key' }
+        data: { id: appId, name: 'Hash Test App', ownerId: 'owner_1', apiKey: hashApiKey('hash-test-key') }
       });
 
       let previousHash = GENESIS_HASH;
@@ -102,7 +104,7 @@ describe('hash chain service', () => {
 
     it('returns valid for an empty chain', async () => {
       await prisma.app.create({
-        data: { id: appId, name: 'Hash Test App', ownerId: 'owner_1', apiKey: 'hash-test-key' }
+        data: { id: appId, name: 'Hash Test App', ownerId: 'owner_1', apiKey: hashApiKey('hash-test-key') }
       });
 
       await expect(verifyChain(appId)).resolves.toMatchObject({ valid: true, entriesChecked: 0 });
@@ -119,7 +121,7 @@ describe('hash chain service', () => {
 
     it('returns valid when metadata contains objects nested inside arrays', async () => {
       await prisma.app.create({
-        data: { id: appId, name: 'Hash Test App', ownerId: 'owner_1', apiKey: 'hash-test-key' }
+        data: { id: appId, name: 'Hash Test App', ownerId: 'owner_1', apiKey: hashApiKey('hash-test-key') }
       });
 
       const createdAt = new Date('2026-04-24T10:00:01.000Z');
