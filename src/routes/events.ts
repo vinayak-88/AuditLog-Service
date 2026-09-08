@@ -95,7 +95,8 @@ async function createAuditLogEntry(
    *   and re-attempt rather than an error bubble to the client. Three retries
    *   is enough for realistic burst traffic; a persistent failure after three
    *   attempts is a sign of something genuinely wrong and should propagate.
-   */
+  */
+
   for (let attempt = 1; attempt <= SERIALIZATION_RETRIES; attempt += 1) {
     try {
       const entry = await prisma.$transaction(
@@ -136,17 +137,6 @@ async function createAuditLogEntry(
               metadata: metadata as Prisma.InputJsonValue | undefined,
               ipAddress: input.ipAddress ?? null,
               userAgent: input.userAgent ?? null,
-              /*
-               * NOTE: idempotency support is implemented in this build.
-               *
-               * Clients can provide idempotencyKey; the database enforces
-               * uniqueness on (appId, idempotencyKey), and P2002 conflicts return
-               * the existing entry instead of inserting a duplicate retry.
-               *
-               * Store the idempotencyKey on the row so Phase 1 and Phase 3 can
-               * look it up. If the caller sent no key, this is null — Prisma
-               * omits null optional fields correctly.
-               */
               idempotencyKey: input.idempotencyKey ?? null,
               entryHash,
               previousHash,
@@ -182,7 +172,7 @@ async function createAuditLogEntry(
          * We only do this fallback if an idempotencyKey was actually provided —
          * a P2002 on any other unique column (e.g. a future constraint) should
          * still propagate as an error.
-         */
+        */
         if (err.code === 'P2002' && input.idempotencyKey) {
           logger.info({
             message: 'Idempotency key race resolved via unique constraint; fetching winning entry',

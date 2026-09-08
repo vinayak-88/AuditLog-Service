@@ -16,7 +16,7 @@ function canonicalizeJson(value: unknown): unknown {
     return value;
   }
   if (Array.isArray(value)) {
-    return value.map(canonicalizeJson);
+    return value.map(canonicalizeJson);  //value.map(item => canonicalizeJson(item))
   }
   const record = value as Record<string, unknown>;
   return Object.keys(record)
@@ -131,7 +131,6 @@ export async function verifyChain(appId: string): Promise<VerificationResult> {
           }
         };
       }
-
       previousHash = entry.entryHash;
     }
 

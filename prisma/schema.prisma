@@ -8,12 +8,12 @@ datasource db {
 }
 
 model App {
-  id          String     @id @default(cuid())
+  id          String     @id @default(uuid(7))@db.Uuid()
   name        String
   description String?
   apiKey      String     @unique
   ownerId     String
-  isActive    Boolean    @default(true)
+  isActive    Boolean    @default(true)  
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
 
@@ -24,8 +24,8 @@ model App {
 }
 
 model AuditLog {
-  id             String   @id @default(cuid())
-  appId          String
+  id             String   @id @default(uuid(7))@db.Uuid()
+  appId          String   @db.Uuid()
   actorId        String
   actorType      String
   action         String
@@ -45,8 +45,6 @@ model AuditLog {
   app            App      @relation(fields: [appId], references: [id])
 
   @@unique([appId, sequenceNumber])
-  /// CHANGED: makes the idempotency guarantee safe under concurrent requests by
-  /// allowing only one row for a given app/key pair while permitting many nulls.
   @@unique([appId, idempotencyKey], name: "unique_app_idempotency_key")
   @@index([appId, createdAt])
   @@index([appId, actorId])

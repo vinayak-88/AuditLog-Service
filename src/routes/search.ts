@@ -70,11 +70,7 @@ router.get(
   validateQuery(SearchEventsSchema),
   asyncHandler(async (req, res) => {
     const app = req.auditApp!;
-    /*
-     * CHANGED: use the Zod-inferred query type after validateQuery has coerced
-     * req.query, so buildEventWhere receives a typed object instead of a loose
-     * Record with redundant runtime type checks.
-     */
+    
     const query = req.query as SearchEventsInput & typeof req.query;
     const page = query.page;
     const limit = query.limit;
