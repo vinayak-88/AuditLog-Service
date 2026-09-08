@@ -6,7 +6,7 @@ import { useState } from 'react';
 export default function ExportPage() {
   const [apiKey, setApiKey] = useState('');
   const [loading, setLoading] = useState(false);
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
+  const baseUrl = process.env.NEXT_PUBLIC_API_URL!;
 
   async function downloadCsv() {
     setLoading(true);

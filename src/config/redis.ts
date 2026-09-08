@@ -2,10 +2,9 @@ import Redis from 'ioredis';
 import logger from './logger';
 
 const redis = new Redis({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
+  host: process.env.REDIS_HOST!,
+  port: Number.parseInt(process.env.REDIS_PORT!, 10),
   password: process.env.REDIS_PASSWORD || undefined,
-  lazyConnect: process.env.NODE_ENV === 'test',
   maxRetriesPerRequest: 3,
   retryStrategy: (times) => Math.min(times * 100, 3000)
 });

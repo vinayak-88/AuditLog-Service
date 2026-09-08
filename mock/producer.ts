@@ -1,17 +1,17 @@
 import 'dotenv/config';
 
-const API_URL = process.env.API_URL || 'http://localhost:3000';
+const API_URL = process.env.API_URL!;
 const API_KEY = process.env.MOCK_API_KEY;
 
 async function main() {
   if (!API_KEY) {
-    throw new Error('Set MOCK_API_KEY to an app API key before running the mock producer.');
+    throw new Error('Set MOCK_API_KEY to an app API key before running the producer.');
   }
 
   const actions = ['invoice.created', 'invoice.updated', 'invoice.deleted', 'login.succeeded'];
 
   for (let index = 0; index < 10; index += 1) {
-    const response = await fetch(`${API_URL}/events`, {
+    const response = await fetch(`${API_URL}/v1/events`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${API_KEY}`,
@@ -23,7 +23,7 @@ async function main() {
         action: actions[index % actions.length],
         resourceId: `invoice_${(index % 4) + 1}`,
         resourceType: 'invoice',
-        metadata: { source: 'mock-producer', index }
+        metadata: { source: 'producer', index }
       })
     });
 

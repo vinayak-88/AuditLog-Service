@@ -23,7 +23,7 @@ export function createApp() {
   app.use(helmet());
   app.use(
     cors({
-      origin: (process.env.CORS_ORIGINS ?? process.env.NEXTAUTH_URL ?? 'http://localhost:3001')
+      origin: (process.env.CORS_ORIGINS ?? '')
         .split(',')
         .map((o) => o.trim())
         .filter(Boolean),
@@ -93,7 +93,7 @@ if (require.main === module) {
   validateEnv();
   const PORT = Number.parseInt(process.env.PORT || '3000', 10);
   const server = app.listen(PORT, () => {
-    logger.info(`API server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
+    logger.info(`API server running on port ${PORT}`);
   });
 
   async function shutdown(signal: string) {

@@ -4,7 +4,7 @@ type ApiOptions = {
   init?: RequestInit;
 };
 
-const API_URL = process.env.API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
+const API_URL = process.env.API_URL!;
 
 function buildUrl(path: string, query?: ApiOptions['query']) {
   const url = new URL(path, API_URL);
@@ -38,7 +38,7 @@ export async function dashboardFetch<T>(path: string, init?: RequestInit): Promi
   const internalKey = process.env.INTERNAL_API_KEY;
 
   if (internalKey) headers.set('Authorization', `Bearer ${internalKey}`);
-  headers.set('x-owner-id', process.env.DASHBOARD_OWNER_ID || 'dashboard-dev-user');
+  headers.set('x-owner-id', process.env.DASHBOARD_OWNER_ID!);
   headers.set('Content-Type', 'application/json');
 
   const response = await fetch(buildUrl(path), {

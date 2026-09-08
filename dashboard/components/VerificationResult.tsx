@@ -20,7 +20,7 @@ export function VerificationResult() {
     setLoading(true);
     setResult(null);
 
-    const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'}/verify`, {
+    const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL!}/verify`, {
       headers: { Authorization: `Bearer ${apiKey}` }
     });
     const body = await response.json();

@@ -40,7 +40,7 @@ import { z } from 'zod';
  *     idempotencyKey String?
  *     @@unique([appId, idempotencyKey], name: "unique_app_idempotency_key")
  *
- *   Then run: npx prisma migrate dev --name add_idempotency_key
+  *   Then create and apply the corresponding production migration.
  *
  *   The @@unique constraint is what makes the race condition safe: even if two
  *   concurrent requests with the same key both pass the application-level check,

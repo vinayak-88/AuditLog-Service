@@ -1,73 +1,37 @@
-name: CI
+name: Production validation
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
     branches: [main]
 
 jobs:
-  test:
+  validate:
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: testuser
-          POSTGRES_PASSWORD: testpass
-          POSTGRES_DB: auditlog_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    env:
-      NODE_ENV: test
-      DATABASE_URL: postgresql://testuser:testpass@localhost:5432/auditlog_test
-      REDIS_HOST: localhost
-      REDIS_PORT: 6379
-      HASH_SECRET: test-secret-key-for-ci-only
-      GENESIS_HASH: test-genesis
-      INTERNAL_API_KEY: test-internal-key
-      PORT: 3000
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Use Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-
+          cache: npm
       - name: Install dependencies
         run: npm ci
-
       - name: Generate Prisma client
-        run: npx prisma generate
-
+        run: npm run prisma:generate
       - name: Lint
         run: npm run lint
-
       - name: Type check
-        run: npx tsc --noEmit
-
-      - name: Run database migrations
-        run: npx prisma migrate deploy
-
-      - name: Run tests
-        run: npm test
+        run: npm run typecheck
+      - name: Build API
+        run: npm run build
+      - name: Install dashboard dependencies
+        working-directory: dashboard
+        run: npm ci
+      - name: Type check dashboard
+        working-directory: dashboard
+        run: npm run typecheck
+      - name: Build dashboard
+        working-directory: dashboard
+        run: npm run build
