@@ -1,13 +1,13 @@
+import { buildApiUrl } from './api-url';
+
 type ApiOptions = {
   query?: Record<string, string | number | undefined>;
   apiKey?: string;
   init?: RequestInit;
 };
 
-const API_URL = process.env.API_URL!;
-
 function buildUrl(path: string, query?: ApiOptions['query']) {
-  const url = new URL(path, API_URL);
+  const url = buildApiUrl(path, process.env.API_URL || process.env.NEXT_PUBLIC_API_URL);
   if (query) {
     Object.entries(query).forEach(([key, value]) => {
       if (value !== undefined && value !== '') url.searchParams.set(key, String(value));

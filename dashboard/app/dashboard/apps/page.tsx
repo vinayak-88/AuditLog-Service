@@ -1,5 +1,7 @@
 import { dashboardFetch } from '../../../lib/api';
 
+export const dynamic = 'force-dynamic';
+
 type AppsResponse = {
   success: true;
   data: {
@@ -15,7 +17,7 @@ type AppsResponse = {
 };
 
 export default async function AppsPage() {
-  const response = await dashboardFetch<AppsResponse>('/apps');
+  const response = await dashboardFetch<AppsResponse>('/v1/apps');
   const apps = response?.data.apps ?? [];
 
   return (

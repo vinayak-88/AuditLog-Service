@@ -2,6 +2,8 @@ import { EventTable } from '../../components/EventTable';
 import { StatsCards } from '../../components/StatsCards';
 import { apiFetch } from '../../lib/api';
 
+export const dynamic = 'force-dynamic';
+
 type EventsResponse = {
   success: true;
   data: {
@@ -20,7 +22,7 @@ type EventsResponse = {
 };
 
 export default async function DashboardPage() {
-  const response = await apiFetch<EventsResponse>('/events', { query: { limit: 10 } });
+  const response = await apiFetch<EventsResponse>('/v1/events', { query: { limit: 10 } });
   const events = response?.data.events ?? [];
 
   return (

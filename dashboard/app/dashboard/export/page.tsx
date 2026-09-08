@@ -2,25 +2,31 @@
 
 import { Download } from 'lucide-react';
 import { useState } from 'react';
+import { buildApiUrl } from '../../../lib/api-url';
 
 export default function ExportPage() {
   const [apiKey, setApiKey] = useState('');
   const [loading, setLoading] = useState(false);
-  const baseUrl = process.env.NEXT_PUBLIC_API_URL!;
-
   async function downloadCsv() {
     setLoading(true);
-    const response = await fetch(`${baseUrl}/export?format=csv`, {
-      headers: { Authorization: `Bearer ${apiKey}` }
-    });
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = 'audit-events.csv';
-    anchor.click();
-    URL.revokeObjectURL(url);
-    setLoading(false);
+    try {
+      const url = buildApiUrl('/v1/export', process.env.NEXT_PUBLIC_API_URL);
+      url.searchParams.set('format', 'csv');
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiKey}` }
+      });
+      if (!response.ok) return;
+
+      const blob = await response.blob();
+      const downloadUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = downloadUrl;
+      anchor.download = 'audit-events.csv';
+      anchor.click();
+      URL.revokeObjectURL(downloadUrl);
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (

@@ -2,6 +2,8 @@ import { EventTable } from '../../../components/EventTable';
 import { SearchFilters } from '../../../components/SearchFilters';
 import { apiFetch } from '../../../lib/api';
 
+export const dynamic = 'force-dynamic';
+
 type EventsResponse = {
   success: true;
   data: {
@@ -19,7 +21,7 @@ type EventsResponse = {
 };
 
 export default async function EventsPage({ searchParams }: { searchParams: Record<string, string | undefined> }) {
-  const response = await apiFetch<EventsResponse>('/events', { query: searchParams });
+  const response = await apiFetch<EventsResponse>('/v1/events', { query: searchParams });
 
   return (
     <div className="grid">
