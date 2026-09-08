@@ -77,6 +77,21 @@ select {
   padding: 28px;
 }
 
+.auth-page {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.auth-panel {
+  display: grid;
+  gap: 16px;
+  max-width: 420px;
+  width: 100%;
+}
+
 .topbar {
   display: flex;
   justify-content: space-between;

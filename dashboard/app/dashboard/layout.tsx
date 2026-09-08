@@ -1,5 +1,9 @@
+import { getServerSession } from 'next-auth';
 import Link from 'next/link';
+import { redirect } from 'next/navigation';
 import { Activity, Download, KeyRound, LayoutDashboard, Search, ShieldCheck } from 'lucide-react';
+import { SignOutButton } from '../../components/AuthControls';
+import { authOptions } from '../../lib/auth';
 
 const nav = [
   { href: '/dashboard', label: 'Overview', icon: LayoutDashboard },
@@ -9,7 +13,10 @@ const nav = [
   { href: '/dashboard/apps', label: 'Apps', icon: KeyRound }
 ];
 
-export default function DashboardLayout({ children }: { children: React.ReactNode }) {
+export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
+  const session = await getServerSession(authOptions);
+  if (!session) redirect('/login');
+
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -28,6 +35,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             );
           })}
         </nav>
+        <SignOutButton />
       </aside>
       <main className="main">{children}</main>
     </div>
