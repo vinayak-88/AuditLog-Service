@@ -1,3 +1,4 @@
+import { afterAll, describe, expect, it } from '@jest/globals';
 import { cacheActivityEntry, getActivityFeed } from '../src/services/activityCache';
 import prisma from '../src/config/db';
 import redis from '../src/config/redis';
