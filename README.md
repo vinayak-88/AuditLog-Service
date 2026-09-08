@@ -46,7 +46,7 @@ npm start
 - `POST /v1/events` ingests an audit event and appends it to the hash chain.
 - `GET /v1/events` searches events without exposing internal hash fields.
 - `GET /v1/events/activity/:resourceId` reads recent activity.
-- `GET /v1/verify` recomputes the chain and reports the first tampered sequence.
+- `POST /v1/verify` starts chain verification; poll `GET /v1/verify/:jobId` for the result.
 - `GET /v1/export?format=csv|json` exports filtered events.
 - `GET /health` checks PostgreSQL and Redis.
 

@@ -22,7 +22,7 @@ describe('POST /events', () => {
 
   it('accepts a valid event and creates the first chain link', async () => {
     const response = await request(app)
-      .post('/events')
+      .post('/v1/events')
       .set('Authorization', `Bearer ${apiKey}`)
       .send({
         actorId: 'user_123',
@@ -42,7 +42,7 @@ describe('POST /events', () => {
   });
 
   it('rejects missing API keys', async () => {
-    const response = await request(app).post('/events').send({});
+    const response = await request(app).post('/v1/events').send({});
 
     expect(response.status).toBe(401);
     expect(response.body.error.code).toBe('MISSING_API_KEY');
@@ -50,7 +50,7 @@ describe('POST /events', () => {
 
   it('rejects invalid payloads', async () => {
     const response = await request(app)
-      .post('/events')
+      .post('/v1/events')
       .set('Authorization', `Bearer ${apiKey}`)
       .send({ actorId: 'user_123' });
 
@@ -67,8 +67,8 @@ describe('POST /events', () => {
       resourceType: 'invoice'
     };
 
-    await request(app).post('/events').set('Authorization', `Bearer ${apiKey}`).send(payload);
-    const response = await request(app).post('/events').set('Authorization', `Bearer ${apiKey}`).send(payload);
+    await request(app).post('/v1/events').set('Authorization', `Bearer ${apiKey}`).send(payload);
+    const response = await request(app).post('/v1/events').set('Authorization', `Bearer ${apiKey}`).send(payload);
 
     expect(response.status).toBe(201);
     expect(response.body.data.sequenceNumber).toBe(2);

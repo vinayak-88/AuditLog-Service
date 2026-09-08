@@ -20,7 +20,7 @@ describe('GET /events', () => {
   });
 
   it('returns filtered events without hash fields', async () => {
-    await request(app).post('/events').set('Authorization', `Bearer ${apiKey}`).send({
+    await request(app).post('/v1/events').set('Authorization', `Bearer ${apiKey}`).send({
       actorId: 'user_123',
       actorType: 'user',
       action: 'invoice.deleted',
@@ -29,7 +29,7 @@ describe('GET /events', () => {
     });
 
     const response = await request(app)
-      .get('/events')
+      .get('/v1/events')
       .query({ actorId: 'user_123' })
       .set('Authorization', `Bearer ${apiKey}`);
 
