@@ -55,6 +55,31 @@ export async function apiKeyAuth(req: Request, res: Response, next: NextFunction
   }
 
   const apiKey = header.slice('Bearer '.length).trim();
+
+  const internalKey = process.env.INTERNAL_API_KEY;
+  const ownerId = req.header('x-owner-id');
+  const appId = req.header('x-app-id');
+
+  if (internalKey && apiKey === internalKey && ownerId && appId) {
+    try {
+      const ownedApp = await prisma.app.findFirst({
+        where: { id: appId, ownerId, isActive: true }
+      });
+
+      if (ownedApp) {
+        req.auditApp = ownedApp;
+        return next();
+      }
+    } catch (err) {
+      return next(err);
+    }
+
+    return res.status(403).json({
+      success: false,
+      error: { message: 'Application is not owned by the authenticated dashboard user', code: 'APP_ACCESS_DENIED', statusCode: 403 }
+    });
+  }
+
   const cacheKey = getApiKeyCacheKey(apiKey);
 
   try {

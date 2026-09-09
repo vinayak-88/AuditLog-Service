@@ -2,20 +2,25 @@
 
 import { Download } from 'lucide-react';
 import { useState } from 'react';
-import { buildApiUrl } from '../../../lib/api-url';
 
 export default function ExportPage() {
-  const [apiKey, setApiKey] = useState('');
+  const [appId, setAppId] = useState('');
+  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   async function downloadCsv() {
     setLoading(true);
+    setError(null);
     try {
-      const url = buildApiUrl('/v1/export', process.env.NEXT_PUBLIC_API_URL);
-      url.searchParams.set('format', 'csv');
-      const response = await fetch(url, {
-        headers: { Authorization: `Bearer ${apiKey}` }
+      const response = await fetch('/api/dashboard/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ appId, format: 'csv' })
       });
-      if (!response.ok) return;
+      if (!response.ok) {
+        const body = (await response.json()) as { error?: string };
+        setError(body.error ?? 'Unable to export events');
+        return;
+      }
 
       const blob = await response.blob();
       const downloadUrl = URL.createObjectURL(blob);
@@ -24,6 +29,8 @@ export default function ExportPage() {
       anchor.download = 'audit-events.csv';
       anchor.click();
       URL.revokeObjectURL(downloadUrl);
+    } catch {
+      setError('Unable to reach the export service');
     } finally {
       setLoading(false);
     }
@@ -36,26 +43,27 @@ export default function ExportPage() {
       </div>
       <div className="card toolbar">
         <div className="field">
-          <label htmlFor="export-key">API key</label>
+          <label htmlFor="export-app-id">Application ID</label>
           <input
-            id="export-key"
+            id="export-app-id"
             className="input"
-            type="password"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
+            value={appId}
+            onChange={(event) => setAppId(event.target.value)}
+            placeholder="Application UUID"
           />
         </div>
         <button
           className="button"
           type="button"
           onClick={downloadCsv}
-          disabled={!apiKey || loading}
+          disabled={!appId || loading}
           title="Export CSV"
         >
           <Download size={16} aria-hidden />
           {loading ? 'Exporting' : 'CSV'}
         </button>
       </div>
+      {error ? <div className="card status-danger">{error}</div> : null}
     </div>
   );
 }

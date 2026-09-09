@@ -35,7 +35,7 @@ export function createApp() {
        * but browsers will not send that header cross-origin unless CORS permits
        * it explicitly.
        */
-      allowedHeaders: ['Content-Type', 'Authorization', 'x-owner-id', 'x-user-id', 'x-request-id'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'x-owner-id', 'x-user-id', 'x-app-id', 'x-request-id'],
       /*
        * CHANGED: expose x-request-id so browser clients can read the response
        * correlation ID and include it in their own error reporting.

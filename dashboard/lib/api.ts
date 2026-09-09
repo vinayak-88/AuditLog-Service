@@ -7,6 +7,7 @@ import { buildApiUrl } from './api-url';
 
 type ApiOptions = {
   query?: Record<string, string | number | undefined>;
+  appId?: string;
   init?: RequestInit;
 };
 
@@ -30,10 +31,10 @@ function buildUrl(path: string, query?: ApiOptions['query']) {
   return url;
 }
 
-export async function dashboardFetch<T>(
+export async function dashboardRequest(
   path: string,
   options: ApiOptions = {}
-): Promise<T | null> {
+): Promise<Response> {
   const session = await getServerSession(authOptions);
 
   const ownerId = session?.user?.id;
@@ -52,13 +53,23 @@ export async function dashboardFetch<T>(
 
   headers.set('Authorization', `Bearer ${internalKey}`);
   headers.set('x-owner-id', ownerId);
+  if (options.appId) {
+    headers.set('x-app-id', options.appId);
+  }
   headers.set('Content-Type', 'application/json');
 
-  const response = await fetch(buildUrl(path, options.query), {
+  return fetch(buildUrl(path, options.query), {
     ...options.init,
     headers,
     cache: 'no-store'
   });
+}
+
+export async function dashboardFetch<T>(
+  path: string,
+  options: ApiOptions = {}
+): Promise<T | null> {
+  const response = await dashboardRequest(path, options);
 
   if (!response.ok) return null;
 
