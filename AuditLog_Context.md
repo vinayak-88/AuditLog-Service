@@ -1066,7 +1066,6 @@ RATE_LIMIT_EXPORT_MAX=10
 API_KEY_CACHE_TTL_SECONDS=600        # How long API key lookups are cached in Redis
 ACTIVITY_CACHE_MAX_ENTRIES=50        # Max events stored per resource in Redis sorted set
 ACTIVITY_CACHE_TTL_SECONDS=3600      # TTL on activity cache keys (1 hour)
-DASHBOARD_OWNER_ID="owner-id-used-by-server-dashboard-requests"
 MOCK_API_KEY="api-key-used-by-mock-producer"
 
 # Verify job config

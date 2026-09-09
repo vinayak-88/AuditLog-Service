@@ -1,17 +1,23 @@
 import 'server-only';
 
 import { getServerSession } from 'next-auth';
+import { redirect } from 'next/navigation';
 import { authOptions } from './auth';
 import { buildApiUrl } from './api-url';
 
 type ApiOptions = {
   query?: Record<string, string | number | undefined>;
-  apiKey?: string;
   init?: RequestInit;
 };
 
 function buildUrl(path: string, query?: ApiOptions['query']) {
-  const url = buildApiUrl(path, process.env.API_URL || process.env.NEXT_PUBLIC_API_URL);
+  const apiUrl = process.env.API_URL;
+
+  if (!apiUrl) {
+    throw new Error('API_URL must be configured for server-side dashboard API requests');
+  }
+
+  const url = buildApiUrl(path, apiUrl);
 
   if (query) {
     Object.entries(query).forEach(([key, value]) => {
@@ -24,40 +30,16 @@ function buildUrl(path: string, query?: ApiOptions['query']) {
   return url;
 }
 
-export async function apiFetch<T>(
-  path: string,
-  options: ApiOptions = {}
-): Promise<T | null> {
-  const apiKey = options.apiKey || process.env.DASHBOARD_APP_API_KEY;
-  const headers = new Headers(options.init?.headers);
-
-  if (apiKey) {
-    headers.set('Authorization', `Bearer ${apiKey}`);
-  }
-
-  headers.set('Content-Type', 'application/json');
-
-  const response = await fetch(buildUrl(path, options.query), {
-    ...options.init,
-    headers,
-    cache: 'no-store'
-  });
-
-  if (!response.ok) return null;
-
-  return (await response.json()) as T;
-}
-
 export async function dashboardFetch<T>(
   path: string,
-  init?: RequestInit
+  options: ApiOptions = {}
 ): Promise<T | null> {
   const session = await getServerSession(authOptions);
 
   const ownerId = session?.user?.id;
 
   if (!ownerId) {
-    return null;
+    redirect('/login');
   }
 
   const internalKey = process.env.INTERNAL_API_KEY;
@@ -66,14 +48,14 @@ export async function dashboardFetch<T>(
     throw new Error('INTERNAL_API_KEY must be configured for dashboard API requests');
   }
 
-  const headers = new Headers(init?.headers);
+  const headers = new Headers(options.init?.headers);
 
   headers.set('Authorization', `Bearer ${internalKey}`);
   headers.set('x-owner-id', ownerId);
   headers.set('Content-Type', 'application/json');
 
-  const response = await fetch(buildUrl(path), {
-    ...init,
+  const response = await fetch(buildUrl(path, options.query), {
+    ...options.init,
     headers,
     cache: 'no-store'
   });

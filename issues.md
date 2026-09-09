@@ -83,9 +83,8 @@ The Docker API entry point is `npx prisma migrate deploy && node dist/app.js` in
 ### CRITICAL: OAuth identity is not connected to owner authorization
 
 - **Files:** `src/middleware/auth.ts`, `dashboard/lib/api.ts`
-- **Evidence:** backend accepts one shared `INTERNAL_API_KEY` plus `x-owner-id`; dashboard sends `DASHBOARD_OWNER_ID` from configuration. The owner is not derived from the GitHub session.
-- **Impact:** authorization is a shared-secret/static-owner model, not user authorization. Any compromise of the internal key or server-side request path can expose the configured owner's applications.
-- **Required fix:** map authenticated OAuth subjects to owner records and avoid trusting arbitrary caller-supplied owner headers.
+- **Status:** resolved. The dashboard server obtains the owner ID from the authenticated NextAuth session's GitHub `token.sub`, then sends it with the trusted `INTERNAL_API_KEY`.
+- **Authorization boundary:** the Express API accepts `x-owner-id` only alongside the exact internal bearer key and scopes app queries by that owner ID.
 
 ### CRITICAL: verification UI uses the wrong endpoint and response contract
 
@@ -372,14 +371,13 @@ Dashboard configuration used by code:
 
 - `API_URL`
 - `NEXT_PUBLIC_API_URL` (build-time public URL)
-- `DASHBOARD_OWNER_ID`
-- `DASHBOARD_APP_API_KEY` (currently expected by event pages but absent from `.env.example`)
+- `INTERNAL_API_KEY` (server-only dashboard-to-API credential)
 - `NEXTAUTH_URL`
 - `NEXTAUTH_SECRET`
 - `GITHUB_CLIENT_ID`
 - `GITHUB_CLIENT_SECRET`
 
-The dashboard variables are not currently validated at startup, and the authentication design does not safely connect them to user identity.
+The dashboard server derives ownership from the authenticated GitHub session. Browser verification/export requests remain separate app-API-key flows.
 
 ## 14. Recommended Deployment Sequence
 
