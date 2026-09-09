@@ -9,7 +9,7 @@ import exportRouter from './routes/export';
 import healthRouter from './routes/health';
 import searchRouter from './routes/search';
 import verifyRouter from './routes/verify';
-import { apiKeyAuth } from './middleware/auth';
+import { apiKeyAuth, dashboardOrApiKeyAuth } from './middleware/auth';
 import { errorHandler } from './middleware/errorHandler';
 import { requestId } from './middleware/requestId';
 import { validateEnv } from './config/validateEnv';
@@ -69,11 +69,10 @@ export function createApp() {
    */
   app.use('/v1/apps', appsRouter);
 
-  app.use(apiKeyAuth);
-  app.use('/v1/events', eventsRouter);
-  app.use('/v1/events', searchRouter);
-  app.use('/v1/verify', verifyRouter);
-  app.use('/v1/export', exportRouter);
+  app.use('/v1/events', apiKeyAuth, eventsRouter);
+  app.use('/v1/events', apiKeyAuth, searchRouter);
+  app.use('/v1/verify', dashboardOrApiKeyAuth, verifyRouter);
+  app.use('/v1/export', dashboardOrApiKeyAuth, exportRouter);
 
   app.use((_req, res) => {
     res.status(404).json({

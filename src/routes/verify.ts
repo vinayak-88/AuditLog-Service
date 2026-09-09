@@ -227,6 +227,17 @@ router.get(
       });
     }
 
+    if (parsed.data.appId !== app.id) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          message: 'Verification job not found',
+          code: 'JOB_NOT_FOUND',
+          statusCode: 404
+        }
+      });
+    }
+
     return res.json({ success: true, data: parsed.data });
   })
 );

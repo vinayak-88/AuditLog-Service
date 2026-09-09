@@ -56,30 +56,6 @@ export async function apiKeyAuth(req: Request, res: Response, next: NextFunction
 
   const apiKey = header.slice('Bearer '.length).trim();
 
-  const internalKey = process.env.INTERNAL_API_KEY;
-  const ownerId = req.header('x-owner-id');
-  const appId = req.header('x-app-id');
-
-  if (internalKey && apiKey === internalKey && ownerId && appId) {
-    try {
-      const ownedApp = await prisma.app.findFirst({
-        where: { id: appId, ownerId, isActive: true }
-      });
-
-      if (ownedApp) {
-        req.auditApp = ownedApp;
-        return next();
-      }
-    } catch (err) {
-      return next(err);
-    }
-
-    return res.status(403).json({
-      success: false,
-      error: { message: 'Application is not owned by the authenticated dashboard user', code: 'APP_ACCESS_DENIED', statusCode: 403 }
-    });
-  }
-
   const cacheKey = getApiKeyCacheKey(apiKey);
 
   try {
@@ -130,6 +106,44 @@ export async function apiKeyAuth(req: Request, res: Response, next: NextFunction
 
   req.auditApp = app;
   return next();
+}
+
+export async function dashboardOrApiKeyAuth(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers.authorization;
+  const internalKey = process.env.INTERNAL_API_KEY;
+  const token = header?.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : null;
+
+  if (internalKey && token === internalKey) {
+    const ownerId = req.header('x-owner-id');
+    const appId = req.header('x-app-id');
+
+    if (!ownerId || !appId) {
+      return res.status(403).json({
+        success: false,
+        error: { message: 'Dashboard application authorization required', code: 'DASHBOARD_AUTH_REQUIRED', statusCode: 403 }
+      });
+    }
+
+    try {
+      const ownedApp = await prisma.app.findFirst({
+        where: { id: appId, ownerId, isActive: true }
+      });
+
+      if (!ownedApp) {
+        return res.status(403).json({
+          success: false,
+          error: { message: 'Application is not owned by the authenticated dashboard user', code: 'APP_ACCESS_DENIED', statusCode: 403 }
+        });
+      }
+
+      req.auditApp = ownedApp;
+      return next();
+    } catch (err) {
+      return next(err);
+    }
+  }
+
+  return apiKeyAuth(req, res, next);
 }
 
 export function getDashboardOwnerId(req: Request): string | null {
