@@ -1,37 +1,86 @@
-name: Production validation
+name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
 
 jobs:
-  validate:
+  test:
+    name: Test & Build
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: audituser
+          POSTGRES_PASSWORD: auditpass
+          POSTGRES_DB: auditlog_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U audituser -d auditlog_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      PORT: 3000
+      DATABASE_URL: postgresql://audituser:auditpass@localhost:5432/auditlog_test?schema=public
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      CORS_ORIGINS: http://localhost:3000
+      HASH_SECRET: ci-deterministic-hash-secret-value-32chars
+      GENESIS_HASH: audit-log-genesis
+      INTERNAL_API_KEY: ci-deterministic-internal-api-key
+      VERIFY_JOB_TTL_SECONDS: 3600
+      RATE_LIMIT_EVENTS_MAX: 1000
+      RATE_LIMIT_VERIFY_MAX: 1000
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Use Node.js 20
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: npm
+
       - name: Install dependencies
         run: npm ci
+
       - name: Generate Prisma client
         run: npm run prisma:generate
-      - name: Lint
+
+      - name: Run TypeScript type check
+        run: npm run typecheck
+
+      - name: Run ESLint
         run: npm run lint
-      - name: Type check
-        run: npm run typecheck
-      - name: Build API
+
+      - name: Run database migrations
+        run: npm run prisma:migrate
+
+      - name: Run test suite
+        run: npm test -- --runInBand
+
+      - name: Run production build
         run: npm run build
-      - name: Install dashboard dependencies
-        working-directory: dashboard
-        run: npm ci
-      - name: Type check dashboard
-        working-directory: dashboard
-        run: npm run typecheck
-      - name: Build dashboard
-        working-directory: dashboard
-        run: npm run build
+
+      - name: Validate formatting and whitespace
+        run: git diff --check
