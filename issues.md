@@ -1,23 +1,24 @@
 # Production Readiness Audit
 
-**Audit date:** 2026-09-10 (re-audit; supersedes the 2026-09-08 findings below where marked resolved)
+**Audit date:** 2026-09-10 (status update; prior 2026-09-08 findings retained below only where still relevant)
 
 ## Deployment Status
 
-**CONDITIONAL GO — API ready; dashboard partially ready (see A1)**
+**READY TO BEGIN DEPLOYMENT**
 
-The Express API, BullMQ verification worker, PostgreSQL/Prisma layer, Docker
-images, and CI integration are verified and deployable. Nearly all 2026-09-08
-blockers are resolved (see Resolved section). Two pre-launch items remain:
-dashboard Overview/Events pages cannot read events with current credentials
-(A1 — must resolve by fix or explicit descoping), and unpatched Next.js 14
-framework advisories with no non-breaking fix (B1 — plan upgrade or document
-risk acceptance for internal-only use).
+The current codebase is deployable. There are no known MUST-FIX codebase
+blockers remaining: dashboard event-read authorization and app selection (A1),
+public `/health` error disclosure (B3), dashboard CI validation (B4), and
+backend/dashboard environment validation (B6) are complete and verified, along
+with all earlier API-key, verification, migration, Docker, dependency, and
+documentation work (see Resolved section).
 
-No application code was changed for this status update; findings were verified
-against the current implementation, not carried forward from the prior audit.
+The remaining items are deliberately deferred risk and deployment procedure:
+the Next.js 14/PostCSS advisories (no non-breaking fix; internal/OAuth-gated
+use only until the separate 14→16 migration) and migration release / database
+role separation (handled as part of deployment, not code).
 
-## 1. Resolved Since 2026-09-08 (verified against current code)
+## 1. Resolved (verified against current code; kept for traceability)
 
 - **API-key hashing:** `App.apiKey` stores an HMAC-SHA256 digest
   (`src/services/apiKey.ts`, keyed by `HASH_SECRET`); raw `als_` keys are
@@ -45,108 +46,91 @@ against the current implementation, not carried forward from the prior audit.
   `dist`, `tests`, `logs`, `dashboard`, git metadata); production image runs as
   non-root `node` with a `/health` HEALTHCHECK; Compose runs
   postgres/redis/api/worker with dependency healthchecks. The image does **not**
-  run migrations at startup (prior audit §2/§7 claim otherwise was incorrect);
-  migrations run via explicit `npm run prisma:migrate`.
+  run migrations at startup; migrations run via explicit
+  `npm run prisma:migrate`.
 - **CI:** provisions PostgreSQL 15 + Redis 7 services, runs generate →
   typecheck → lint → `migrate deploy` → `jest --runInBand` → build →
-  `git diff --check`. (Dashboard typecheck/build still not in CI — see B4.)
+  `git diff --check`; plus an independent dashboard job (`npm ci`,
+  typecheck, build with non-secret deployment-shaped config). No deploy/CD
+  behavior in CI by design.
 - **Dashboard auth:** layout enforces `getServerSession` with redirect to
   `/login` (`dashboard/app/dashboard/layout.tsx`); owner id comes from GitHub
   `token.sub`; `dashboard/lib/api.ts` is `server-only`, sends
-  `INTERNAL_API_KEY` + `x-owner-id` (+ `x-app-id` for verify/export); browsers
-  never receive the internal key. Verify/export go through session-guarded
-  proxy routes with UUID validation and appId-match checks; the verify UI
-  starts jobs, polls to completion, and surfaces errors; export has
-  try/finally error handling. `/v1` path normalization via `buildApiUrl`.
-- **Dependencies:** root audit is clean (`morgan` 1.12.0, `body-parser` 1.20.8,
-  `qs` 6.16.0 via `overrides`); dashboard `next-auth` 4.24.15, `nanoid`
-  3.3.18, `uuid` 11.1.1 resolved. Remaining: Next.js/postcss (B1/B2).
+  `INTERNAL_API_KEY` + `x-owner-id` (+ `x-app-id` for scoped reads); browsers
+  never receive the internal key (verified absent from client bundles).
+  Verify/export go through session-guarded proxy routes with UUID validation
+  and appId-match checks; the verify UI starts jobs, polls to completion, and
+  surfaces errors; export has try/finally error handling. `/v1` path
+  normalization via `buildApiUrl`.
+- **A1 dashboard event reads (resolved):** read-only event/search/activity
+  routes accept dashboard owner/app credentials through the existing
+  ownership-verified `dashboardOrApiKeyAuth` model (`src/app.ts`;
+  ingestion stays customer-key-only). Overview/Events pages resolve an
+  explicit selected app from the owner's app list (`dashboard/lib/
+  app-selection.ts`, `AppSelector.tsx`), send it as `x-app-id` server-side,
+  preserve it across searches, show the existing empty state only when the
+  owner truly has no apps, and render error cards instead of silent empty
+  data (`dashboardFetch` throws on non-2xx). Covered by
+  `tests/dashboardEvents.test.ts` plus a live 12-point authz matrix
+  (owner/cross-owner/random-ID/no-context/customer-key/search/activity).
+- **B3 health disclosure (resolved):** `/health` returns only generic
+  `connected`/`unavailable` per dependency publicly (`src/routes/health.ts`);
+  raw messages stay in server-side Winston logs. 200/503 semantics unchanged;
+  verified live for healthy and degraded paths.
+- **B6 environment validation (resolved):** backend `validateEnv`
+  (`src/config/validateEnv.ts`, also invoked by the worker entrypoint)
+  rejects malformed numerics for all 23 consumed settings (ports 1–65535,
+  counts/TTLs positive integers; unset still means "use default"), malformed
+  `DATABASE_URL`/`CORS_ORIGINS`, missing secrets, and weak
+  `HASH_SECRET`/`INTERNAL_API_KEY` in production (warning only elsewhere, so
+  compose defaults and CI keep working). Dashboard validates required config
+  at build/start via `dashboard/scripts/validate-env.cjs` (called from
+  `next.config.mjs`): required keys, http(s) URL shapes, `NEXTAUTH_SECRET`
+  length; server-only values never reach the browser.
+- **Dependencies (non-breaking):** root audit is clean (`morgan` 1.12.0,
+  `body-parser` 1.20.8, `qs` 6.16.0 via `overrides`); dashboard `next-auth`
+  4.24.15, `nanoid` 3.3.18, `uuid` 11.1.1 resolved. Remaining: Next.js/postcss
+  (deferred risk, §2).
+- **Documentation:** all seven project documents describe the current
+  implementation (BullMQ verification, dual auth, migrations, Docker/CI).
 - **Secrets hygiene:** no tracked `.env`; no hardcoded credentials found;
   Winston logs to console only.
 
-## 2. Outstanding Issues (classified)
+## 2. Known Risks / Deferred Work (no MUST-FIX items remain)
 
-### A. MUST FIX BEFORE DEPLOYMENT
+### Deferred security risk: Next.js 14 / PostCSS vulnerabilities
 
-#### A1. Dashboard Overview/Events pages cannot read events (silent empty UI)
+- **Files:** `dashboard/package.json` (`next@14.2.35`), transitive
+  `postcss@8.4.31` pinned under it.
+- **State:** `npm audit --omit=dev` still reports the Next.js critical
+  cluster and postcss highs. They are **not fixed**; patched releases exist
+  only on the 15/16 lines.
+- **Exposure (current code):** no `next/image`, rewrites, `remotePatterns`,
+  or i18n routing in use; dashboard is OAuth-gated (only `/login` public);
+  target is Vercel/Linux. Residual exposure is generic RSC/cache/DoS vectors
+  on an internal tool.
+- **Decision:** deliberately deferred for the initial internal/OAuth-gated
+  deployment. Next.js 14→16 is a **separate breaking migration** (React 19
+  peer, `next-auth` v5 compatibility work, full regression) and is **not**
+  part of this deployment. The dashboard must **not** be treated as broadly
+  public until that framework upgrade is completed; record the acceptance and
+  schedule the upgrade as follow-up work.
 
-- **Files:** `dashboard/app/dashboard/page.tsx`, `dashboard/app/dashboard/events/page.tsx`, `dashboard/lib/api.ts`, `src/app.ts`, `src/middleware/auth.ts`, `src/routes/search.ts`
-- **Problem:** both pages call `GET /v1/events` through `dashboardRequest`,
-  which always presents `INTERNAL_API_KEY`. The backend mounts event/search
-  routers behind `apiKeyAuth` **only** (no `dashboardOrApiKeyAuth` fallback),
-  so the digest lookup fails → 401 → `dashboardFetch` returns `null` → pages
-  render zeros/empty tables with no error.
-- **Impact:** two core dashboard pages are non-functional at launch; the
-  silent-`null` pattern hides the failure from operators and users.
-- **Action:** choose one before dashboard launch: (a) extend owner-scoped
-  reads to event search (backend decision + app-picker UX, since one owner may
-  own many apps), or (b) descope/hide these pages until (a) lands. Also make
-  `dashboardFetch` surface non-OK states instead of bare `null`.
+### Deployment concern: B5 migration release / database role separation
 
-### B. SHOULD FIX BEFORE DEPLOYMENT
+- **State:** primarily deployment procedure now, not a code blocker. The
+  image intentionally does not migrate at startup (avoids replica races).
+- **Action at deploy time:** run `prisma migrate deploy` explicitly as the
+  migration/release step before the API rollout, then verify
+  `migrate status`.
+- **Hardening:** separate migration and runtime database roles per what the
+  hosting platform supports (least-privilege runtime that cannot alter
+  triggers/schema); can be handled according to the platform.
 
-#### B1. Next.js 14 has unpatched critical advisories; only fix is breaking 14→16
-
-- **Files:** `dashboard/package.json` (`next@14.2.35`), `dashboard/package-lock.json`
-- **Problem:** `npm audit --omit=dev` reports critical Next.js advisories
-  (RCE/SSRF/cache-poisoning/DoS cluster); patched releases exist only on the
-  15/16 lines (`next@16.3.4`, breaking).
-- **Exposure analysis (current code):** no `next/image`, rewrites,
-  `remotePatterns`, or i18n routing in use (`next.config.mjs` sets only
-  `reactStrictMode`); dashboard is OAuth-gated (only `/login` is public);
-  deployment target is Vercel/Linux (not the windows-only RCE vector).
-  Residual exposure is generic RSC/cache/DoS vectors on an internal tool.
-- **Action:** schedule the 14→16 upgrade (+ React 19 peer, `next-auth` v5
-  migration, full regression). For an internal-only launch, documented risk
-  acceptance is defensible; do not expose the dashboard publicly without the
-  upgrade.
-
-#### B2. postcss high advisories (same root cause as B1)
-
-- **Files:** transitive `postcss@8.4.31` pinned under `next@14.2.35`
-- **Problem:** XSS/file-read/traversal advisories, fixable only via the same
-  breaking Next upgrade. No dashboard code invokes postcss directly.
-- **Action:** resolved by the B1 upgrade; track together.
-
-#### B3. `/health` returns raw dependency error strings publicly
-
-- **Files:** `src/routes/health.ts`
-- **Problem:** caught PostgreSQL/Redis messages (hosts, ports, connection
-  details) are embedded in the unauthenticated response.
-- **Impact:** low-sensitivity topology disclosure; useful to operators.
-- **Action:** return generic `unavailable` per dependency publicly, keep
-  details in server logs (small, unambiguous change).
-
-#### B4. CI does not typecheck/build the dashboard
-
-- **Files:** `.github/workflows/ci.yml`
-- **Problem:** one job covers the root API only; dashboard `typecheck`/`build`
-  are validated manually. A dashboard-only breakage passes CI.
-- **Action:** add a dashboard job (install, typecheck, build with
-  non-secret config).
-
-#### B5. No migration release step / single database role
-
-- **Files:** `Dockerfile`, `docker-compose.yml`, absence of hosting config
-- **Problem:** migrations run manually via `npm run prisma:migrate` with the
-  same credential the runtime uses (DDL-capable; could alter triggers).
-- **Action:** define the Railway release step (`migrate deploy` before API
-  rollout) and, if the platform supports it, separate migration and runtime
-  roles.
-
-#### B6. Environment validation is presence-only
-
-- **Files:** `src/config/validateEnv.ts`
-- **Problem:** no numeric/range checks (`PORT`, TTLs, limits, batch sizes) and
-  no secret-strength checks; malformed numbers degrade at first use, not at
-  startup. Dashboard required vars throw at first request, not at boot.
-- **Action:** validate types/ranges/minimums at startup (API) and boot
-  (dashboard); small change.
-
-### C. SAFE TO DEFER (known tradeoffs)
+### C. SAFE TO DEFER (known tradeoffs, still accurate)
 
 - **C1. Process-local rate limiting** (`src/middleware/rateLimiter.ts`): correct
-  for single-replica API; add a Redis store only if horizontally scaled.
+  for single-replica API; add a Redis-backed store only if horizontally scaled.
 - **C2. Default DB pool/connection timeouts** (`src/config/db.ts`,
   `src/config/redis.ts`): Prisma/ioredis defaults are acceptable at current
   scale; tune with production load data. Health checks already bound
@@ -165,35 +149,38 @@ against the current implementation, not carried forward from the prior audit.
 ## 3. Verified Areas (no action)
 
 Authn/z (digest keys, rotation/deactivation, owner+app scoping, IDOR polling
-checks, session guards, server-only internal key); verification lifecycle
-(sentinel atomicity, heartbeat, retries, terminal release, shutdown semantics);
-data integrity (trigger, idempotency incl. P2002 race path, Serializable
-ingestion, no destructive queries in `src/`); reliability (async handling,
-validation, shutdown, request IDs, JSON logging); secrets/Docker hygiene;
-Prisma generate/migrate/status/diff; full test suite green (see §5).
+checks, session guards, server-only internal key, owner-scoped event reads);
+verification lifecycle (sentinel atomicity, heartbeat, retries, terminal
+release, shutdown semantics); data integrity (trigger, idempotency incl. P2002
+race path, Serializable ingestion, no destructive queries in `src/`);
+reliability (async handling, validation incl. startup env checks, shutdown,
+request IDs, JSON logging, generic health statuses); secrets/Docker hygiene;
+Prisma generate/migrate/status/diff; full test suite green (see §4).
 
 ## 4. Validation Results (2026-09-10)
 
 - `npm run prisma:generate` — pass
 - `npm run typecheck` — pass
 - `npm run lint` — pass
-- `npm test -- --runInBand` — 31/31 pass, 7/7 suites (isolated test DB; Compose
+- `npm test -- --runInBand` — 38/38 pass, 8/8 suites (isolated test DB; Compose
   worker paused during verification suites to avoid shared-queue contention,
   then restarted healthy)
 - `npm run build` — pass
 - `cd dashboard && npm run typecheck` — pass
 - `cd dashboard && npm run build` — pass (all routes compiled)
+- Root `npm audit --omit=dev` — 0 vulnerabilities; dashboard audit — only the
+  deferred Next.js/postcss items above
 - `git diff --check` — clean
 
 ## 5. Deployment Sequence
 
-1. Resolve A1 (fix or descope dashboard event pages); record B1 risk decision.
-2. Provision Railway PostgreSQL/Redis (private networking, backups) + Vercel
-   dashboard; configure OAuth callback, `API_URL`/`NEXT_PUBLIC_API_URL`,
-   `CORS_ORIGINS`, and production secrets (never reuse Compose/CI values).
-3. Run `npm run prisma:migrate` as the release step (B5), verify
-   `migrate status`.
-4. Deploy API + worker (same image, worker command), then dashboard; verify
-   `/health`, login, apps, events (per A1), verify poll, export.
-5. Confirm log access, tamper-alert mail path, backup/restore, and key
-  rotation procedures.
+1. Provision production PostgreSQL + Redis.
+2. Configure production API/worker environment variables.
+3. Run `prisma migrate deploy` as the migration/release step.
+4. Deploy API + verification worker.
+5. Configure and deploy dashboard.
+6. Configure GitHub OAuth callback/domain.
+7. Configure CORS/API URLs.
+8. Run end-to-end production smoke tests.
+9. Verify logs, alerts, backups/restore, and API-key rotation.
+10. Record the Next.js risk acceptance and schedule the later framework upgrade.
