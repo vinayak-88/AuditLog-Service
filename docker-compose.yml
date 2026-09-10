@@ -9,6 +9,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U audituser -d auditlog"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
@@ -17,6 +22,53 @@ services:
     command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - DATABASE_URL=postgresql://audituser:auditpass@postgres:5432/auditlog?schema=public
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:3001
+      - HASH_SECRET=${HASH_SECRET:-dev-hash-secret}
+      - GENESIS_HASH=${GENESIS_HASH:-audit-log-genesis}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-dev-internal-api-key}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "dist/workers/verificationWorker.js"]
+    healthcheck:
+      disable: true
+    environment:
+      - DATABASE_URL=postgresql://audituser:auditpass@postgres:5432/auditlog?schema=public
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=
+      - HASH_SECRET=${HASH_SECRET:-dev-hash-secret}
+      - GENESIS_HASH=${GENESIS_HASH:-audit-log-genesis}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   postgres_data:
