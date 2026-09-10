@@ -16,13 +16,24 @@ type AppsResponse = {
   };
 };
 
+function toErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Unable to load applications';
+}
+
 export default async function AppsPage() {
-  let apps: AppsResponse['data']['apps'] = [];
+  let apps: AppsResponse['data']['apps'];
   try {
     const response = await dashboardFetch<AppsResponse>('/v1/apps');
     apps = response.data.apps;
-  } catch {
-    apps = [];
+  } catch (error) {
+    return (
+      <div className="grid">
+        <div className="topbar">
+          <h1 className="page-title">Apps</h1>
+        </div>
+        <div className="card status-danger">{toErrorMessage(error)}</div>
+      </div>
+    );
   }
 
   return (
