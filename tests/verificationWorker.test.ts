@@ -7,8 +7,17 @@ import { randomUUID } from 'crypto';
 import { verificationQueue } from '../src/queues/verificationQueue';
 import redis from '../src/config/redis';
 import { createVerificationWorker } from '../src/workers/verificationWorker';
-import { getVerifyJob, saveVerifyJob, type VerifyJob } from '../src/services/verificationJobs';
+import {
+  acquireVerifySlot,
+  getVerifyActiveKey,
+  getVerifyJob,
+  renewVerifySlot,
+  saveVerifyJob,
+  startVerifyHeartbeat,
+  type VerifyJob
+} from '../src/services/verificationJobs';
 import { verifyChain } from '../src/services/hashChain';
+import type { VerificationResult } from '../src/types';
 
 const mockedVerifyChain = verifyChain as jest.MockedFunction<typeof verifyChain>;
 
@@ -26,10 +35,12 @@ describe('verification worker', () => {
   const appId = 'worker-test-app';
   let worker: ReturnType<typeof createVerificationWorker>;
 
-  beforeAll(async () => {
-    worker = createVerificationWorker();
-    await worker.waitUntilReady();
-  });
+beforeAll(async () => {
+  await verificationQueue.obliterate({ force: true });
+
+  worker = createVerificationWorker();
+  await worker.waitUntilReady();
+});
 
   beforeEach(async () => {
     mockedVerifyChain.mockReset();
@@ -76,5 +87,45 @@ describe('verification worker', () => {
     expect(job.error).toBe('permanent verification failure');
     expect(job.attemptsMade).toBe(2);
     expect(mockedVerifyChain).toHaveBeenCalledTimes(2);
+  });
+
+  it('heartbeat renews the sentinel while the verification is running', async () => {
+  const jobId = randomUUID();
+  const activeKey = getVerifyActiveKey(appId);
+
+  await redis.set(activeKey, jobId, 'EX', 2);
+
+  const stopHeartbeat = startVerifyHeartbeat(appId, jobId, 500);
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const sentinelOwner = await redis.get(activeKey);
+    expect(sentinelOwner).toBe(jobId);
+
+    const ttl = await redis.ttl(activeKey);
+    expect(ttl).toBeGreaterThan(0);
+  } finally {
+    stopHeartbeat();
+    await redis.del(activeKey);
+  }
+}, 10000);
+
+  it('renewVerifySlot does not extend the TTL when a different job owns the sentinel', async () => {
+    const ownerJobId = randomUUID();
+    const otherJobId = randomUUID();
+    const activeKey = getVerifyActiveKey(appId);
+
+    await redis.set(activeKey, ownerJobId, 'EX', 5);
+
+    // Attempting to renew with a non-matching jobId must return false.
+    const renewed = await renewVerifySlot(appId, otherJobId);
+    expect(renewed).toBe(false);
+
+    // The original sentinel must still belong to ownerJobId.
+    const currentOwner = await redis.get(activeKey);
+    expect(currentOwner).toBe(ownerJobId);
+
+    await redis.del(activeKey);
   });
 });

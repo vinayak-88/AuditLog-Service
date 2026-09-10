@@ -7,6 +7,7 @@ import {
   saveVerifyJob,
   getVerifyJob,
   releaseVerifySlot,
+  startVerifyHeartbeat,
   type VerifyJob
 } from '../services/verificationJobs';
 import {
@@ -51,6 +52,7 @@ async function processVerificationJob(job: Job<VerificationJobData>): Promise<vo
   };
   await saveVerifyJob(runningJob);
 
+  const stopHeartbeat = startVerifyHeartbeat(job.data.appId, job.data.jobId);
   try {
     const result = await verifyChain(job.data.appId);
     const completedJob: VerifyJob = {
@@ -87,6 +89,8 @@ async function processVerificationJob(job: Job<VerificationJobData>): Promise<vo
     }
     logger.error({ message: finalAttempt ? 'Verification job failed' : 'Verification job will retry', jobId: job.data.jobId, error });
     throw err;
+  } finally {
+    stopHeartbeat();
   }
 }
 
