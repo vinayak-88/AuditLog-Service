@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { asyncHandler } from '../middleware/asyncHandler';
 import prisma from '../config/db';
+import logger from '../config/logger';
 import redis from '../config/redis';
 
 const router = Router();
@@ -29,14 +30,25 @@ router.get(
       await withTimeout(prisma.$queryRaw`SELECT 1`, 'PostgreSQL');
     } catch (err) {
       healthy = false;
-      dependencies.postgresql = `error: ${err instanceof Error ? err.message : 'unknown'}`;
+      // Public responses carry only a generic status. Raw messages can
+      // contain hostnames, ports, and connection details, so they stay in
+      // server-side logs.
+      logger.error({
+        message: 'PostgreSQL health check failed',
+        error: err instanceof Error ? err.message : err
+      });
+      dependencies.postgresql = 'unavailable';
     }
 
     try {
       await withTimeout(redis.ping(), 'Redis');
     } catch (err) {
       healthy = false;
-      dependencies.redis = `error: ${err instanceof Error ? err.message : 'unknown'}`;
+      logger.error({
+        message: 'Redis health check failed',
+        error: err instanceof Error ? err.message : err
+      });
+      dependencies.redis = 'unavailable';
     }
 
     return res.status(healthy ? 200 : 503).json({

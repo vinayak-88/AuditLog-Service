@@ -84,3 +84,39 @@ jobs:
 
       - name: Validate formatting and whitespace
         run: git diff --check
+
+  dashboard:
+    name: Dashboard typecheck & build
+    runs-on: ubuntu-latest
+
+    env:
+      API_URL: http://localhost:3000
+      NEXT_PUBLIC_API_URL: http://localhost:3000
+      INTERNAL_API_KEY: ci-deterministic-internal-api-key
+      NEXTAUTH_URL: http://localhost:3001
+      NEXTAUTH_SECRET: ci-deterministic-nextauth-secret-32chars-minimum
+      GITHUB_CLIENT_ID: ci-dummy-github-client-id
+      GITHUB_CLIENT_SECRET: ci-dummy-github-client-secret
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install dashboard dependencies
+        run: npm ci
+        working-directory: dashboard
+
+      - name: Run dashboard TypeScript type check
+        run: npm run typecheck
+        working-directory: dashboard
+
+      - name: Run dashboard production build
+        run: npm run build
+        working-directory: dashboard

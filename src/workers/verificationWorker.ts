@@ -3,6 +3,7 @@ import { Job, Worker } from 'bullmq';
 import { sendTamperAlert } from '../services/alertService';
 import { verifyChain } from '../services/hashChain';
 import logger from '../config/logger';
+import { validateEnv } from '../config/validateEnv';
 import {
   saveVerifyJob,
   getVerifyJob,
@@ -95,6 +96,7 @@ async function processVerificationJob(job: Job<VerificationJobData>): Promise<vo
 }
 
 if (require.main === module) {
+  validateEnv();
   const worker = createVerificationWorker();
   worker.on('completed', (job) => logger.info({ message: 'Verification job completed', jobId: job?.id }));
   worker.on('failed', (job, err) => logger.error({ message: 'Verification queue job failed', jobId: job?.id, error: err }));
