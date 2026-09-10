@@ -4,13 +4,12 @@
 
 Express is initialized by createApp() in src/app.ts. The application mounts routes in this order:
 
-1. GET /health through healthRouter, before per-app authentication.
-2. /v1/apps through appsRouter, before per-app authentication.
-3. apiKeyAuth globally for every router below it.
-4. /v1/events through eventsRouter, then searchRouter.
-5. /v1/verify through verifyRouter.
-6. /v1/export through exportRouter.
-7. A global JSON 404 handler and then errorHandler.
+1. GET /health through healthRouter, with no authentication.
+2. /v1/apps through appsRouter, with route-local dashboard-owner authorization (no `apiKeyAuth`).
+3. /v1/events through eventsRouter (`POST /`) and searchRouter (`GET /`, `GET /activity/:resourceId`), each behind `apiKeyAuth` (customer app key only).
+4. /v1/verify through verifyRouter behind `dashboardOrApiKeyAuth` (customer key **or** `INTERNAL_API_KEY` + `x-owner-id` + `x-app-id`).
+5. /v1/export through exportRouter behind `dashboardOrApiKeyAuth` (same dual credential).
+6. A global JSON 404 handler and then errorHandler.
 
 The shared event prefix is intentional: eventsRouter declares POST / while searchRouter declares GET / and GET /activity/:resourceId. There are no controller classes; each handler performs its own Prisma/service calls.
 
@@ -23,22 +22,22 @@ Global security and parsing middleware runs before these routes. Its exact order
 | Method | Complete path | Router | Authentication |
 |---|---|---|---|
 | GET | /health | health.ts | None |
-| GET | /v1/apps | apps.ts | Internal API key plus owner header |
+| GET | /v1/apps | apps.ts | `INTERNAL_API_KEY` + `x-owner-id`/`x-user-id` (route-local requireOwnerId) |
 | POST | /v1/apps | apps.ts | Same dashboard authorization |
-| POST | /v1/apps/:id/rotate-key | apps.ts | Same dashboard authorization |
-| DELETE | /v1/apps/:id | apps.ts | Same dashboard authorization |
-| POST | /v1/events | events.ts | Active application API key |
-| GET | /v1/events | search.ts | Active application API key |
-| GET | /v1/events/activity/:resourceId | search.ts | Active application API key |
-| POST | /v1/verify | verify.ts | Active application API key |
-| GET | /v1/verify/:jobId | verify.ts | Active application API key |
-| GET | /v1/export | export.ts | Active application API key |
+| POST | /v1/apps/:id/rotate-key | apps.ts | Same dashboard authorization + URL id must belong to that owner |
+| DELETE | /v1/apps/:id | apps.ts | Same dashboard authorization + URL id must belong to that owner |
+| POST | /v1/events | events.ts | Active application API key (`apiKeyAuth`) |
+| GET | /v1/events | search.ts | Active application API key (`apiKeyAuth`) |
+| GET | /v1/events/activity/:resourceId | search.ts | Active application API key (`apiKeyAuth`) |
+| POST | /v1/verify | verify.ts | Active app key **or** dashboard `INTERNAL_API_KEY` + `x-owner-id` + `x-app-id` |
+| GET | /v1/verify/:jobId | verify.ts | Same dual credential as POST; job additionally scoped to the authenticated app |
+| GET | /v1/export | export.ts | Same dual credential as verify |
 
 ## Health route
 
 ### GET /health
 
-**Why it exists:** exposes the current connectivity result for PostgreSQL and Redis.
+**Why it exists:** exposes the current connectivity result for PostgreSQL and Redis. Used by the Dockerfile HEALTHCHECK and available to platform probes.
 
 **Flow:** route -> asyncHandler -> PostgreSQL SELECT 1 and Redis PING, each raced against a three-second timeout -> response.
 
@@ -61,13 +60,9 @@ Both responses include an ISO timestamp and a dependencies object with postgresq
 
 ## Apps management routes
 
-All app routes are mounted before apiKeyAuth. They call requireOwnerId() inside their handlers. That helper calls getDashboardOwnerId() and throws AppError with 401 DASHBOARD_AUTH_REQUIRED when no owner can be derived.
+All app routes are mounted before any global auth middleware. They call requireOwnerId() inside their handlers. That helper calls getDashboardOwnerId() and throws AppError with 401 DASHBOARD_AUTH_REQUIRED when no owner can be derived.
 
-A request is authorized when either:
-
-- Authorization is Bearer followed by exactly INTERNAL_API_KEY and it supplies x-owner-id or x-user-id; that header becomes the owner scope.
-
-The router does not authenticate with an application API key.
+A request is authorized when `Authorization: Bearer <INTERNAL_API_KEY>` is paired with `x-owner-id` or `x-user-id`; that header becomes the owner scope. The router does not accept an application API key. There is no separate User table; the owner id is the dashboard user's GitHub identity.
 
 ### GET /v1/apps
 
@@ -75,11 +70,11 @@ The router does not authenticate with an application API key.
 
 **Handler chain:** appsRouter GET / -> asyncHandler -> requireOwnerId -> Prisma App.findMany -> JSON response.
 
-**Route-specific middleware:** no apps rate limiter is applied to this GET route.
+**Route-specific middleware:** no rate limiter is applied to this GET route.
 
 **Database operation:** reads App rows where ownerId equals the derived owner and isActive is true; orders newest createdAt first; includes related AuditLog count.
 
-**Response:** 200 with data.apps. Every returned item has id, name, description, isActive, ISO createdAt, and _count containing auditLogs. API keys and owner IDs are not returned.
+**Response:** 200 with data.apps. Every returned item has id, name, description, isActive, ISO createdAt, and _count containing auditLogs. API-key digests, raw keys, and owner IDs are not returned.
 
 **Errors:** missing dashboard authorization reaches the central handler as 401. Database errors inside the async handler become generic 500 unless represented by AppError.
 
@@ -98,7 +93,7 @@ The router does not authenticate with an application API key.
 
 Unknown body properties are removed by normal Zod object parsing rather than rejected.
 
-**Database operation:** creates an App with derived ownerId, validated name, description or null, and a newly generated API key digest. createApiKey produces the raw `als_` key; its HMAC digest is stored.
+**Database operation:** creates an App with derived ownerId, validated name, description or null, and the HMAC digest of a newly generated `als_` key (`hashApiKey`, keyed by `HASH_SECRET`).
 
 **Response:** 201 with id, name, description, the raw apiKey, and ISO createdAt. The raw key is returned once; only its HMAC digest is stored in the database.
 
@@ -108,19 +103,19 @@ Unknown body properties are removed by normal Zod object parsing rather than rej
 
 **Why it exists:** replaces a registered app's API key while retaining the App and audit-log rows.
 
-**Handler chain:** appsRateLimiter -> asyncHandler -> requireOwnerId -> Zod path parse -> Prisma ownership lookup -> Prisma update -> Redis old-key deletion attempt -> response.
+**Handler chain:** appsRateLimiter -> asyncHandler -> requireOwnerId -> Zod UUID path parse -> Prisma ownership lookup -> Prisma update -> Redis old-key deletion attempt -> response.
 
 **Path parameter:** id is parsed as a UUID, matching the Prisma schema.
 
-**Authorization:** the app lookup requires both the provided ID and current ownerId. An app owned by someone else is indistinguishable from a missing app.
+**Authorization:** the app lookup requires both the provided ID and current ownerId (`findFirst({ id, ownerId })`). An app owned by someone else is indistinguishable from a missing app.
 
 **Database and Redis operations:**
 
 1. Find the App by id and owner ID.
 2. Update apiKey to the HMAC digest of a new random key.
-3. Invalidate the old digest-based cache entry. Redis failure is logged but does not fail the rotation.
+3. Invalidate the old digest-based cache entry (`clearApiKeyCacheDigest`). Redis failure is logged but does not fail the rotation.
 
-**Response:** 200 with data.newApiKey.
+**Response:** 200 with data.newApiKey. The new raw key is returned once.
 
 **Errors:** unknown/wrong-owner app yields 404 APP_NOT_FOUND. Bad path format throws a route-local ZodError, which central error handling maps to 400 VALIDATION_ERROR.
 
@@ -128,11 +123,13 @@ Unknown body properties are removed by normal Zod object parsing rather than rej
 
 **Why it exists:** removes an app from active use without deleting its audit history.
 
-**Handler chain:** appsRateLimiter -> asyncHandler -> requireOwnerId -> CUID path parse -> ownership lookup -> Prisma update -> Redis old-key deletion attempt -> 204.
+**Handler chain:** appsRateLimiter -> asyncHandler -> requireOwnerId -> UUID path parse -> ownership lookup -> Prisma update -> Redis old-key deletion attempt -> 204.
 
-**Database operation:** updates isActive to false. It does not delete the App or its AuditLog rows.
+**Path parameter:** id is parsed as a UUID (same as rotation).
 
-**Redis operation:** attempts to delete the cache entry for the old key. Failure only logs a warning; a previously cached active App can remain usable until its TTL expires because cache-hit validation does not recheck isActive.
+**Database operation:** updates isActive to false. It does not delete the App or its AuditLog rows (the foreign key is `ON DELETE RESTRICT` in any case).
+
+**Redis operation:** attempts to delete the cache entry for the old digest. Failure only logs a warning; a previously cached active App can remain usable until its TTL expires.
 
 **Response:** 204 with no body.
 
@@ -154,9 +151,9 @@ sequenceDiagram
   participant P as PostgreSQL
   participant D as Redis
   C->>A: Bearer application API key
-  A->>D: GET hashed key cache
+  A->>D: GET apikey:{digest} cache
   alt cache miss or cache failure
-    A->>P: Find active App by plaintext key
+    A->>P: Find active App by digest
   end
   A->>R: req.auditApp
   R->>P: Optional idempotency lookup
@@ -188,17 +185,17 @@ sequenceDiagram
 1. When an idempotency key is present, find the existing row for current app ID/key. If present, use it without a transaction.
 2. Otherwise start a Serializable transaction.
 3. Find the latest current-app audit row by descending sequenceNumber.
-4. Derive previousHash and sequenceNumber.
-5. Build a hash payload, recursively canonicalizing metadata object keys.
-6. Compute entryHash and create the AuditLog row.
+4. Derive previousHash (`GENESIS_HASH` when empty) and sequenceNumber (latest + 1, starting at 1).
+5. Build the canonical hash payload (`previousHash + JSON.stringify(payload)` HMAC-SHA256 with `HASH_SECRET`).
+6. Create the AuditLog row with the same timestamp used for hashing.
 7. Retry P2034 serialization failure while attempt is less than three.
 8. On P2002 with an idempotency key, look up the row that won the unique-constraint race and use it.
 
-**Redis operation:** only new rows cause a fire-and-forget cacheActivityEntry call. It stores the activity representation in the app/resource sorted set. Redis failures do not change the successful database response.
+**Redis operation:** only new rows cause a fire-and-forget cacheActivityEntry call into `activity:{appId}:{resourceId}`. Redis failures do not change the successful database response.
 
 **Responses:** 201 for a newly inserted row and 200 for a duplicate idempotency key. Both return data.entryId, data.sequenceNumber, data.entryHash, and ISO data.createdAt.
 
-**Errors:** authentication 401, rate limit 429, validation 400, and normal forwarded unexpected errors 500. After two retries, the third P2034 is rethrown rather than returning the source's later unreachable SERVICE_BUSY AppError.
+**Errors:** authentication 401, rate limit 429, validation 400, and normal forwarded unexpected errors 500.
 
 For the hash and transaction mechanics, see [ARCHITECTURE.md](ARCHITECTURE.md#audit-log-ingestion) and [DATA_STORAGE.md](DATA_STORAGE.md#database-readers-and-writers).
 
@@ -225,7 +222,7 @@ When both dates are present, end must not precede start and their range must be 
 
 **Response:** 200 with data.events and data.pagination containing page, limit, total, and totalPages.
 
-**Errors:** rate limit 429; invalid query 400 VALIDATION_ERROR; authentication 401; database failures forwarded to the generic handler.
+**Errors:** rate limit 429; invalid query 400 VALIDATION_ERROR; authentication 401 (customer key only — dashboard internal credentials are not accepted here); database failures forwarded to the generic handler.
 
 ### GET /v1/events/activity/:resourceId
 
@@ -238,7 +235,7 @@ When both dates are present, end must not precede start and their range must be 
 - resourceId must be a string of 1 through 255 characters.
 - limit is coerced to an integer from 1 through 50, default 20.
 
-**Storage flow:** getActivityFeed reads activity:<appId>:<resourceId> with ZREVRANGE. A nonempty result becomes parsed entries with source cache. An empty result or Redis exception performs a PostgreSQL AuditLog.findMany ordered createdAt descending with the requested limit, starts a non-awaited bulk Redis warm, and returns source database.
+**Storage flow:** getActivityFeed reads `activity:<appId>:<resourceId>` with ZREVRANGE. A nonempty result becomes parsed entries with source cache. An empty result or Redis exception performs a PostgreSQL AuditLog.findMany ordered createdAt descending with the requested limit, starts a non-awaited bulk Redis warm, and returns source database.
 
 **Response:** 200 with data.resourceId, data.source, and data.events.
 
@@ -246,48 +243,50 @@ When both dates are present, end must not precede start and their range must be 
 
 ## Verification routes
 
+Both verification routes sit behind `dashboardOrApiKeyAuth`, so callers use
+either a customer `Bearer <app key>` or `Bearer <INTERNAL_API_KEY>` with
+`x-owner-id` + `x-app-id` (ownership verified per request). The dashboard
+verify pages call backend verify endpoints through server-side proxy routes
+that attach the internal credential for the logged-in GitHub owner.
+
 ### POST /v1/verify
 
-**Why it exists:** starts an asynchronous chain verification for the authenticated application's entire audit history.
+**Why it exists:** persists and enqueues a durable chain verification for the authenticated application's entire audit history.
 
-**Flow:** apiKeyAuth -> verifyRateLimiter -> asyncHandler -> Redis pending-job scan -> optional pending job save -> setImmediate(runVerifyJob) -> 202.
+**Flow:** dashboardOrApiKeyAuth -> verifyRateLimiter -> asyncHandler -> atomic sentinel acquire -> pending job save -> BullMQ add -> 202.
 
 **Request body/query:** none are read or validated.
 
-**Redis and background behavior:**
+**Redis/queue behavior:**
 
-1. SCAN keys matching verify-job:<appId>:* in pages of 20.
-2. GET and JSON-parse keys to find a job whose status is pending.
-3. If a pending job is found, return conflict without creating a new job.
-4. Otherwise create a UUID job ID and a pending object with startedAt.
-5. Try to SET that object with the configured TTL. Failure logs a warning but does not stop processing.
-6. Schedule runVerifyJob in the same Node process with setImmediate.
-7. runVerifyJob calls verifyChain, attempts to save complete/failed state, and starts a non-awaited tamper alert on an invalid result.
-
-The SCAN/check/create sequence is not a Redis atomic lock. No queue, persistent worker, or retry mechanism exists.
+1. Atomically acquire `verify-active:{appId}` for a fresh UUID via Lua (see [DATA_STORAGE.md](DATA_STORAGE.md#verification-active-job-sentinel)).
+2. If the slot is busy, return 409 `JOB_IN_PROGRESS` with the existing job ID and poll URL. Two simultaneous requests resolve to exactly one 202 and one 409.
+3. Otherwise save a `pending`/`queued` VerifyJob at `verify-job:{appId}:{jobId}` (no TTL at this stage).
+4. Enqueue `verify-chain { appId, jobId, appName }` on the BullMQ `verification` queue (durable; attempts 3, exponential backoff 500 ms). On enqueue failure, save `failed`, release the sentinel, and rethrow.
+5. The worker (separate process) picks up the job, marks it `running`, heartbeats the sentinel, runs `verifyChain`, persists the terminal state with TTL, releases the sentinel, and alerts on tampering.
 
 **Responses:**
 
 - 202 success with data.jobId, data.status set to pending, data.startedAt, and relative data.pollUrl.
-- 409 JOB_IN_PROGRESS with the existing job ID and poll URL under data when a pending job was discovered.
+- 409 JOB_IN_PROGRESS with the existing job ID and poll URL under data when the sentinel is held.
 
-**Errors:** verification-start rate limit 429; authentication 401; a Redis scan failure only logs and allows a job to start; unexpected handler errors become generic 500.
+**Errors:** verification-start rate limit 429 (POST only); authentication 401/403 per the dual credential; unexpected handler errors become generic 500.
 
 ### GET /v1/verify/:jobId
 
-**Why it exists:** returns the Redis state created by the start endpoint.
+**Why it exists:** returns the persisted Redis state created by the start endpoint and updated by the worker.
 
-**Flow:** apiKeyAuth -> asyncHandler -> UUID path parse -> Redis GET using authenticated app ID -> JSON parsing and VerifyJobSchema validation -> response.
+**Flow:** dashboardOrApiKeyAuth -> asyncHandler -> UUID path parse -> namespaced Redis read (`readVerifyJob`) -> ownership check -> response.
 
-**Path parameter:** jobId must be a UUID.
+**Path parameter:** jobId must be a UUID (route-local Zod parse → 400 on malformed).
+
+**Ownership:** the key is namespaced by the authenticated app (`verify-job:{app.id}:{jobId}`), and the stored `job.appId` must equal the authenticated app id; any mismatch returns 404 `JOB_NOT_FOUND`. This is what stops one app (or one dashboard app scope) from polling another app's job, including the dashboard path where `x-app-id` selects the scope. The dashboard poll proxy additionally checks `result.data.appId === appId` and returns 404 on mismatch.
 
 **Responses:**
 
-- 200 with the complete stored job object for pending, complete, or failed jobs.
+- 200 with the complete stored job object for pending, running, complete, or failed jobs (running/retrying phases included).
 - 404 JOB_NOT_FOUND when the app-scoped Redis key does not exist.
-- 500 JOB_DATA_CORRUPT when parsed JSON is valid JSON but fails VerifyJobSchema.
-
-If stored Redis content is not valid JSON, JSON.parse throws before safeParse; it reaches the central handler as a generic 500 rather than JOB_DATA_CORRUPT.
+- 500 JOB_DATA_CORRUPT when the stored value fails VerifyJobSchema.
 
 Polling has no route-level rate limiter.
 
@@ -295,9 +294,9 @@ Polling has no route-level rate limiter.
 
 ### GET /v1/export
 
-**Why it exists:** downloads authenticated-app audit events using the search filters.
+**Why it exists:** downloads authenticated-app audit events using the search filters. Accepts the same dual credential as verify. The dashboard export page calls it through a server-side proxy that streams the backend response to the browser.
 
-**Flow:** apiKeyAuth -> exportRateLimiter -> validateQuery(ExportEventsSchema) -> asyncHandler -> buildEventWhere -> cursor-batched Prisma reads -> HTTP stream.
+**Flow:** dashboardOrApiKeyAuth -> exportRateLimiter -> validateQuery(ExportEventsSchema) -> asyncHandler -> buildEventWhere -> cursor-batched Prisma reads -> HTTP stream.
 
 **Query parameters:** it accepts the same actor/resource/date fields as GET /v1/events, plus format set to json or csv with default json. The inherited page and limit fields are validated/defaulted but are not used by export logic. Date-range validation has the same two-sided-only 90-day rule.
 
@@ -325,9 +324,9 @@ The handler calls response.write repeatedly but does not await a drain event whe
 
 - App registration creates the API key required by all per-app routes.
 - Key rotation/deletion attempts to invalidate the cached credential used by apiKeyAuth.
-- Event ingestion creates rows consumed by search, activity fallback/cache, export, and verification.
+- Event ingestion creates rows consumed by search, activity fallback/cache, export, and worker verification.
 - Event ingestion also populates the activity cache read by the activity endpoint.
-- Verification start creates Redis state consumed by verification polling.
+- Verification start creates the sentinel + Redis state consumed by verification polling and the worker lifecycle.
 - Verification results can invoke the Brevo tamper-alert attempt.
 
 For type-level request and response shapes, see [TYPES_AND_INTERFACES.md](TYPES_AND_INTERFACES.md).

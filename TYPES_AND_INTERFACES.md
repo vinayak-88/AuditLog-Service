@@ -2,7 +2,7 @@
 
 ## Type inventory and conventions
 
-The backend uses Zod schemas for runtime HTTP validation and TypeScript aliases/interfaces for compile-time relationships. Zod inferred aliases describe data after validation. Prisma supplies generated model/query types. Express declaration merging adds application fields to Request.
+The backend uses Zod schemas for runtime HTTP validation and TypeScript aliases/interfaces for compile-time relationships. Zod inferred aliases describe data after validation. Prisma supplies generated model/query types. Express declaration merging adds application fields to Request. BullMQ and Redis job state have their own persisted shapes.
 
 The major flow is:
 
@@ -13,7 +13,8 @@ flowchart LR
   Inputs --> Routes[Route/service calls]
   Routes --> Prisma[Prisma model/query types]
   Prisma --> Domain[Hash payload, activity, verification types]
-  Domain --> Response[Response types and JSON]
+  Domain --> Queue[BullMQ payload + Redis job JSON]
+  Queue --> Response[Response types and JSON]
 ~~~
 
 Routes do not currently use the ApiResponse aliases as enforced return types; they call Express response methods directly.
@@ -85,7 +86,7 @@ metadata is null-normalized by the event route before storage/hash creation. Zod
 
 - **Kind:** exported interface.
 - **Purpose:** exact logical value HMACed for an audit row.
-- **Used by:** computeEntryHash parameter; buildHashPayload return; event insertion; verifyChain.
+- **Used by:** computeEntryHash parameter; buildHashPayload return; event insertion; worker verifyChain.
 - **Properties:**
 
 | Property | Type | Meaning |
@@ -105,11 +106,11 @@ Property insertion order in buildHashPayload is important because computeEntryHa
 ### VerificationResult
 
 - **Kind:** exported discriminated union type alias.
-- **Purpose:** output of verifyChain and optional verification-job result.
+- **Purpose:** output of verifyChain and persisted verification-job result.
 - **Discriminant:** valid.
 - **Valid branch:** valid true, entriesChecked number, durationMs number.
 - **Invalid branch:** valid false, entriesChecked number, durationMs number, tamperedAt object with sequenceNumber number and entryId string.
-- **Used by:** hashChain return type; VerifyJob runtime-schema result shape is structurally equivalent.
+- **Used by:** hashChain return type; worker completion record; `VerificationResultSchema` is the structurally equivalent runtime schema.
 
 ### API response types
 
@@ -141,12 +142,6 @@ The true/false literal fields make this a discriminated union for TypeScript con
 - **Properties:** id, actorId, actorType, action, resourceId, resourceType are strings; metadata is Record<string, unknown> or null; createdAt is ISO string.
 - **Relationship:** it is a selected/transformed subset of AuditLog. It excludes hashes, idempotency key, IP address, and user agent.
 
-### AuthenticatedRequest
-
-- **Kind:** exported intersection alias of Express Request and required auditApp: App.
-- **Purpose:** represents a request after successful API-key authentication.
-- **Current use:** exported but not used as a current route parameter type. Route code instead uses req.auditApp! after middleware order guarantees authentication.
-
 ### AsyncHandler
 
 - **Kind:** exported function type alias.
@@ -166,32 +161,46 @@ The true/false literal fields make this a discriminated union for TypeScript con
 |---|---|---|---|
 | id | string | requestId | Correlation ID alias |
 | requestId | string | requestId | Correlation ID used by logging/error handler |
-| auditApp | optional App authorization data without apiKey | apiKeyAuth | Authenticated application for protected routes |
+| auditApp | optional `Omit<App, 'apiKey'>` | apiKeyAuth / dashboardOrApiKeyAuth | Authenticated application for protected routes; never carries the stored digest |
 
 The optional auditApp correctly reflects general Request values before authentication. id/requestId are declared required globally even though only requests that passed requestId have them at runtime; app.ts installs it before all routes.
 
-## Route-local types and schemas
+## Verification, queue, and worker types
 
-### src/routes/verify.ts
+### src/services/verificationJobs.ts
 
 #### VerificationResultSchema
 
-- **Kind:** private Zod schema.
+- **Kind:** exported Zod object schema (moved out of the old route-local definition).
 - **Purpose:** runtime-checks the result field stored in a Redis verification job.
 - **Shape:** valid boolean, entriesChecked number, durationMs number, optional tamperedAt containing number sequenceNumber and string entryId.
-- **Relationship:** permissive valid boolean shape rather than a Zod discriminated union; it structurally accepts either branch of VerificationResult.
+- **Relationship:** permissive boolean shape rather than a Zod discriminated union; it structurally accepts either branch of VerificationResult.
 
-#### VerifyJobSchema
+#### VerifyJobSchema and VerifyJob
 
-- **Kind:** private Zod schema.
-- **Purpose:** validates Redis job JSON before it is returned by polling.
-- **Properties:** UUID jobId; string appId; status pending/complete/failed; string startedAt; optional completedAt; optional result matching VerificationResultSchema; optional error string.
+- **Kind:** exported Zod schema; VerifyJob is inferred via z.infer.
+- **Purpose:** the single source of truth for all persisted temporary job state.
+- **Properties:** UUID jobId; string appId; status `pending`/`running`/`complete`/`failed`; optional phase `queued`/`running`/`retrying`; string startedAt; optional completedAt; optional non-negative integer attemptsMade; optional result matching VerificationResultSchema; optional error string.
+- **Used by:** verify route (build/save/poll), worker lifecycle, `readVerifyJob`/`getVerifyJob`/`saveVerifyJob`.
 
-#### VerifyJob
+#### AcquireResult
 
-- **Kind:** private alias inferred from VerifyJobSchema.
-- **Used by:** getVerifyJobKey/saveVerifyJob/runVerifyJob and both verification route callbacks.
-- **Meaning:** all persisted temporary job state.
+- **Kind:** exported union: `{ acquired: true }` or `{ acquired: false; existingJobId: string }`.
+- **Purpose:** return of the atomic `acquireVerifySlot`.
+- **Used by:** POST /v1/verify to decide between 202 and 409.
+
+### src/queues/verificationQueue.ts
+
+#### VerificationJobData
+
+- **Kind:** exported object type.
+- **Properties:** appId string; jobId string; appName string.
+- **Purpose:** BullMQ payload for `verify-chain` jobs (`verification` queue).
+- **Used by:** verify route `queue.add` and the worker processor.
+
+`VERIFICATION_QUEUE_NAME` (`'verification'`) is also exported from this module.
+
+## Route-local types and schemas
 
 ### src/routes/search.ts
 
@@ -216,9 +225,9 @@ No custom named type is declared. The handler uses ExportEventsInput, imported f
 
 AppError is a class rather than an interface. Its instance properties are statusCode number, code string, and isOperational boolean. The error handler accepts Error intersected with Partial<AppError>, allowing it to inspect operational properties on arbitrary thrown errors. See [error handling](MIDDLEWARE.md#final-error-middleware).
 
-### src/middleware/auth.ts
+### src/middleware/auth.ts: CachedApp
 
-No custom public type is declared. The cached JSON value is parsed as an untyped value, checked structurally through property access, then spread into a value assigned to req.auditApp. This relies on the declaration-merged Prisma App type rather than a dedicated cache-entry type.
+No exported cache-entry type is declared. The cached JSON value is parsed as an untyped value, checked structurally, then spread into `req.auditApp`. The local `CachedApp` alias is `Pick<NonNullable<Request['auditApp']>, 'id' | 'name' | 'description' | 'ownerId' | 'isActive' | 'createdAt' | 'updatedAt'>` — the non-secret subset actually cached and restored.
 
 ## Service-local types
 
@@ -236,11 +245,11 @@ No custom public type is declared. The cached JSON value is parsed as an untyped
 
 This private function is generic over T. Its compute parameter returns Promise<T>; its cache read is asserted as T after JSON.parse; its result is JSON-stringified and returned as T. The generic lets volume, actor, and action aggregations retain distinct result shapes.
 
-The raw volume-query type is Array of objects containing date: string and count: bigint. Conversion to number occurs before return. Top actors use a local asserted array type because groupBy is cast to any. These are local structural types, not exported aliases.
+The raw volume-query type is Array of objects containing date: string and count: bigint. Conversion to number occurs before return. Top actors use a local asserted array type because groupBy is cast to any. These are local structural types, not exported aliases. No route currently calls these functions.
 
 ### src/services/hashChain.ts
 
-The buildHashPayload parameter is an inline structural object type containing App/audit fields and createdAt: Date; it returns HashPayload. verifyChain returns VerificationResult. Buffer values used for timing-safe comparison are Node built-in types inferred from Buffer.from.
+The buildHashPayload parameter is an inline structural object type containing App/audit fields and createdAt: Date; it returns HashPayload. verifyChain returns VerificationResult. Buffer values used for timing-safe comparison are Node built-in types inferred from Buffer.from. `getLatestHashForApp`/`getNextSequenceNumber` are exported for testing/maintenance but documented unsafe outside a Serializable transaction.
 
 ### src/services/activityCache.ts
 
@@ -251,7 +260,7 @@ Function parameters use exported ActivityEntry. getActivityFeed returns an inlin
 | Type/mechanism | Where used | Meaning |
 |---|---|---|
 | PrismaClient | config/db.ts | Generated Prisma database client type. |
-| App | types/index.ts, express declaration | Generated App model type used for req.auditApp. |
+| App | types/index.ts, express declaration | Generated App model type (cached subset omits apiKey). |
 | Prisma.AuditLogWhereInput | search.ts | Generated filter-input type returned by buildEventWhere. |
 | Prisma.AuditLogSelect | search.ts | eventPublicSelect uses satisfies to ensure its selected fields are valid. |
 | Prisma.InputJsonValue | events.ts | Assertion applied to metadata for Prisma create data. |
@@ -259,7 +268,8 @@ Function parameters use exported ActivityEntry. getActivityFeed returns an inlin
 | Prisma.PrismaClientKnownRequestError | events.ts | Runtime error class used for P2034/P2002 branches. |
 | Request, Response, NextFunction | types, middleware, apps route | Express request lifecycle types. |
 | ZodSchema | validation wrappers | Generic runtime schema input. |
-| z.infer | types and route-local schemas | Infers TypeScript values produced by a Zod schema. |
+| z.infer | types, verification jobs, route-local schemas | Infers TypeScript values produced by a Zod schema. |
+| BullMQ Job/Worker/Queue | queue + worker | Durable job payload, processor, and producer types. |
 
 ## Type assertions and narrowing in current code
 
@@ -273,6 +283,7 @@ Function parameters use exported ActivityEntry. getActivityFeed returns an inlin
 - eventPublicSelect uses the safer satisfies operator rather than a broad assertion.
 - analytics casts groupBy to any, then asserts the expected group result array.
 - verification polling parses JSON then uses safeParse for structural validation; invalid JSON itself throws before schema narrowing.
+- worker reads BullMQ `job.attemptsMade`/`job.opts.attempts` to compute attemptsMade and final-attempt behavior.
 
 ## Type flow by feature
 
@@ -286,10 +297,8 @@ Request query -> SearchEventsSchema or ExportEventsSchema -> inferred input -> b
 
 ### Authentication
 
-Express Request -> apiKeyAuth -> declaration-merged optional Request.auditApp without the stored API-key digest -> protected route non-null assertion.
+Express Request -> apiKeyAuth or dashboardOrApiKeyAuth -> declaration-merged optional Request.auditApp (`Omit<App,'apiKey'>`) -> protected route non-null assertion.
 
 ### Verification
 
-random UUID and route-built object -> VerifyJob inferred type -> Redis JSON -> JSON.parse -> VerifyJobSchema.safeParse -> polling response. verifyChain returns VerificationResult, which becomes the job result field.
-
-For source-level callers and functions, see [SRC_CODE_REFERENCE.md](SRC_CODE_REFERENCE.md).
+random UUID and route-built object -> VerifyJob (VerifyJobSchema) -> Redis JSON + BullMQ VerificationJobData -> worker getVerifyJob/saveVerifyJob -> JSON.parse -> VerifyJobSchema.safeParse -> polling response. verifyChain returns VerificationResult, which becomes the job result field. Sentinel ownership is a plain jobId string, not a typed object.

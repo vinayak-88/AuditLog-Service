@@ -4,7 +4,7 @@
 > Feed this entire file as context to any AI assistant before asking for help with any part of the codebase.
 > Every architectural decision, schema definition, API contract, and implementation detail is documented here.
 >
-> Last updated: after dashboard API URL/runtime configuration and GitHub OAuth UI integration.
+> Last updated: after BullMQ durable verification worker, dual dashboard/API-key auth on verify/export, Docker api+worker services, and CI hardening.
 
 ---
 
@@ -22,26 +22,29 @@
 
 | Layer | Technology | Version | Purpose |
 |---|---|---|---|
-| Runtime | Node.js | 20+ LTS | Server-side JavaScript |
+| Runtime | Node.js | 20+ LTS (`>=20`, `node:20-bookworm-slim` images) | Server-side JavaScript |
 | Framework | Express.js | 4.x | REST API routing and middleware |
 | Language | TypeScript | 5.x | Type safety across entire codebase |
 | Frontend framework | Next.js | 14+ (App Router) | Dashboard UI + API routes |
-| Database | PostgreSQL | 15+ | Primary data store — events, apps, verification |
-| ORM | Prisma | 5.x | Database schema, migrations, query client |
-| Cache | Redis | 7+ | API key cache, activity feed cache, verify job state |
+| Database | PostgreSQL | 15+ | Primary data store — events, apps |
+| ORM | Prisma | 5.22.0 (`@prisma/client` + `prisma`) | Database schema, migrations, query client |
+| Cache + jobs | Redis | 7+ | API-key cache, activity cache, verify job state, active-job sentinel, BullMQ backend |
 | Redis client | ioredis | 5.x | Redis connection and commands |
-| Auth | NextAuth.js | 4.x | GitHub OAuth provider |
+| Durable queue | BullMQ | 6.3.4 | Durable verification queue consumed by a separate worker |
+| Auth | NextAuth.js | 4.x | GitHub OAuth provider (dashboard); GitHub user id is the owner identity |
 | Schema validation | Zod | 3.x | Runtime validation of all API inputs |
-| Cryptography | Node.js built-in `crypto` | — | HMAC-SHA256, timingSafeEqual, randomUUID |
+| Cryptography | Node.js built-in `crypto` | — | HMAC-SHA256, timingSafeEqual, randomUUID/randomBytes |
 | Email | Brevo (Sendinblue) | API v3 | Alert emails (chain verification failure, anomalies) |
-| Logging | Winston | 3.x | Structured logging across API |
+| Logging | Winston | 3.x | Structured JSON logging to console |
 | Testing | Jest + Supertest | — | Unit + integration tests |
-| Containerisation | Docker + Docker Compose | — | Local multi-service orchestration |
-| CI/CD | GitHub Actions | — | Automated test runs on push |
-| Deployment — API | Railway | — | Persistent Node.js process |
-| Deployment — Frontend | Vercel | — | Next.js dashboard |
-| Deployment — DB | Railway PostgreSQL | — | Managed PostgreSQL |
-| Deployment — Redis | Railway Redis | — | Managed Redis |
+| Containerisation | Docker + Docker Compose | — | Local multi-service orchestration (postgres, redis, api, worker) |
+| CI | GitHub Actions | — | Automated typecheck/lint/migrate/test/build on push + PR (no deploy step) |
+| Deployment — API | Railway (planned) | — | Persistent Node.js process — not yet automated |
+| Deployment — Frontend | Vercel (planned) | — | Next.js dashboard — not yet automated |
+| Deployment — DB | Railway PostgreSQL (planned) | — | Managed PostgreSQL |
+| Deployment — Redis | Railway Redis (planned) | — | Managed Redis |
+
+There is no `User` table. `App.ownerId` is the GitHub user id (`token.sub` → `session.user.id`). There is no AWS/Terraform/CD pipeline in the codebase.
 
 ---
 
@@ -49,41 +52,52 @@
 
 ```
 audit-log-service/
-├── src/                          # Express API server
+├── src/                          # Express API server + queue + worker
 │   ├── config/
 │   │   ├── db.ts                 # Prisma client singleton
-│   │   ├── redis.ts              # ioredis client singleton
-│   │   └── logger.ts             # Winston logger config
+│   │   ├── redis.ts              # ioredis client singleton (API process)
+│   │   ├── logger.ts             # Winston JSON console logger
+│   │   └── validateEnv.ts        # Required-env validation at startup
 │   ├── middleware/
 │   │   ├── asyncHandler.ts       # Wraps async route handlers, forwards errors to next()
-│   │   ├── auth.ts               # API key auth (Redis-cached) + dashboard auth
+│   │   ├── auth.ts               # apiKeyAuth + dashboardOrApiKeyAuth + getDashboardOwnerId + cache clear
 │   │   ├── errorHandler.ts       # Centralised error handler + AppError class
-│   │   ├── rateLimiter.ts        # express-rate-limit configs (events + verify)
+│   │   ├── rateLimiter.ts        # express-rate-limit configs (events/verify/apps/search/export)
+│   │   ├── requestId.ts          # Correlation ID middleware
 │   │   ├── validate.ts           # Shared validation factory (body or query)
 │   │   ├── validateBody.ts       # Thin wrapper: validate('body', schema)
 │   │   └── validateQuery.ts      # Thin wrapper: validate('query', schema)
 │   ├── routes/
 │   │   ├── events.ts             # POST /v1/events — log ingestion with idempotency
 │   │   ├── search.ts             # GET /v1/events — search/filter + activity feed
-│   │   ├── verify.ts             # POST /v1/verify (start job) + GET /v1/verify/:jobId (poll)
+│   │   ├── verify.ts             # POST /v1/verify (enqueue) + GET /v1/verify/:jobId (poll)
 │   │   ├── export.ts             # GET /v1/export — streaming CSV/JSON export
 │   │   ├── apps.ts               # App registration and API key management
 │   │   └── health.ts             # GET /health — dependency status (unversioned)
 │   ├── services/
 │   │   ├── hashChain.ts          # HMAC hash chain logic — core cryptographic integrity
 │   │   ├── activityCache.ts      # Redis sorted set cache with PostgreSQL fallback
-│   │   ├── analyticsService.ts   # API analytics queries (raw SQL aggregations)
-│   │   └── alertService.ts       # Brevo email alerts for tamper detection
+│   │   ├── analyticsService.ts   # API analytics queries (implemented, no route calls them)
+│   │   ├── alertService.ts       # Brevo email alerts for tamper detection
+│   │   ├── apiKey.ts             # hashApiKey HMAC-SHA256 digest helper
+│   │   └── verificationJobs.ts   # VerifyJob schemas, job keys, sentinel Lua, heartbeat
+│   ├── queues/
+│   │   └── verificationQueue.ts  # BullMQ verification queue handle + closeVerificationQueue
+│   ├── workers/
+│   │   └── verificationWorker.ts # Standalone BullMQ worker (verifyChain + lifecycle)
 │   ├── types/
 │   │   ├── index.ts              # All shared TypeScript types and Zod schemas
-│   │   └── express.d.ts          # Express Request augmentation (auditApp, id)
-│   └── app.ts                    # Express app factory, middleware, route mounting
+│   │   └── express.d.ts          # Express Request augmentation (auditApp without apiKey, id)
+│   └── app.ts                    # Express app factory, middleware, route mounting, shutdown
 ├── dashboard/                    # Next.js App Router frontend
 │   ├── app/
 │   │   ├── layout.tsx
 │   │   ├── page.tsx               # Session-aware redirect to /login or /dashboard
 │   │   ├── login/page.tsx         # GitHub sign-in page
 │   │   ├── api/auth/[...nextauth]/route.ts
+│   │   ├── api/dashboard/verify/route.ts          # Server proxy: start verification
+│   │   ├── api/dashboard/verify/[jobId]/route.ts  # Server proxy: poll verification
+│   │   ├── api/dashboard/export/route.ts          # Server proxy: stream export
 │   │   └── dashboard/
 │   │       ├── page.tsx          # Main dashboard — event volume, recent activity
 │   │       ├── events/page.tsx   # Event search and filter UI
@@ -91,7 +105,7 @@ audit-log-service/
 │   │       ├── export/page.tsx   # Export UI with filter options
 │   │       └── apps/page.tsx     # Active-app listing
 │   ├── lib/
-│   │   ├── api.ts                # Server-side API fetch helpers and auth headers
+│   │   ├── api.ts                # Server-only dashboard fetch helpers (INTERNAL_API_KEY, owner/app headers)
 │   │   ├── api-url.ts            # Configured API URL builder with /v1 normalization
 │   │   └── auth.ts               # Shared NextAuth GitHub provider configuration
 │   ├── scripts/
@@ -104,22 +118,26 @@ audit-log-service/
 │       ├── VerificationResult.tsx
 │       └── StatsCards.tsx
 ├── prisma/
-│   ├── schema.prisma
+│   ├── schema.prisma             # App + AuditLog models, UUID v7, debian-openssl binary target
 │   └── migrations/
+│       ├── 20260908202915_init/                       # Tables, indexes, FK
+│       └── 20260908202916_add_immutability_trigger/   # Append-only trigger
 ├── tests/
 │   ├── hashChain.test.ts
+│   ├── apiKey.test.ts
 │   ├── events.test.ts
 │   ├── verify.test.ts
+│   ├── verificationWorker.test.ts
 │   ├── search.test.ts
 │   └── activityCache.test.ts
 ├── mock/
 │   └── producer.ts               # Mock script that sends sample events
 ├── scripts/
 │   └── hash-existing-api-keys.ts # One-time migration helper for stored keys
-├── docker-compose.yml
-├── Dockerfile
+├── docker-compose.yml            # postgres + redis + api + worker
+├── Dockerfile                    # Multi-stage Node 20 build, non-root production image
 ├── .env.example
-└── .github/workflows/ci.yml
+└── .github/workflows/ci.yml      # Test & build only; no deploy
 ```
 
 ---
@@ -131,6 +149,7 @@ audit-log-service/
   "scripts": {
     "build": "tsc",
     "start": "node dist/app.js",
+    "worker": "node dist/workers/verificationWorker.js",
     "producer": "tsx mock/producer.ts",
     "test": "jest --forceExit --detectOpenHandles",
     "lint": "eslint src tests --ext .ts",
@@ -142,556 +161,187 @@ audit-log-service/
 }
 ```
 
-The dashboard package has only `typecheck`, `build`, and `start`. Its `start` script
-preloads `dashboard/scripts/load-env.cjs`, which loads the repository-root `.env`,
-then runs `next start -p 3001`.
+`npm run worker` starts the standalone verification worker. The Compose
+`worker` service runs `node dist/workers/verificationWorker.js` from the same
+production image as the API.
 
 ---
 
 ## Config Files
 
 ### src/config/db.ts — Prisma Singleton
-```typescript
-import { PrismaClient } from '@prisma/client';
 
-const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
+Standard globalThis-cached PrismaClient singleton (cached outside production).
+No explicit pool settings; `DATABASE_URL` selects the database.
 
-const prisma =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error']
-  });
+### src/config/redis.ts — ioredis Singleton (API process)
 
-if (process.env.NODE_ENV !== 'production') {
-  globalForPrisma.prisma = prisma;
-}
-
-export default prisma;
-```
-
-### src/config/redis.ts — ioredis Singleton
-```typescript
-import Redis from 'ioredis';
-import logger from './logger';
-
-const redis = new Redis({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: Number.parseInt(process.env.REDIS_PORT || '6379', 10),
-  password: process.env.REDIS_PASSWORD || undefined,
-  lazyConnect: process.env.NODE_ENV === 'test',
-  maxRetriesPerRequest: 3,
-  retryStrategy: (times) => Math.min(times * 100, 3000)
-});
-
-redis.on('connect', () => logger.info('Redis connected'));
-redis.on('error', (err) => logger.error({ message: 'Redis error', error: err.message }));
-redis.on('close', () => logger.warn('Redis connection closed'));
-
-export default redis;
-```
+Host/port from `REDIS_HOST`/`REDIS_PORT` (required), optional `REDIS_PASSWORD`,
+`maxRetriesPerRequest: 3`, retry strategy capped at 3 s. Connection/error/close
+events logged via Winston. BullMQ queue/worker connections are separate and use
+`maxRetriesPerRequest: null` as BullMQ requires.
 
 ### src/config/logger.ts — Winston Config
-```typescript
-import fs from 'fs';
-import path from 'path';
-import winston from 'winston';
 
-const logsDir = path.resolve(process.cwd(), 'logs');
-if (!fs.existsSync(logsDir)) {
-  fs.mkdirSync(logsDir, { recursive: true });
-}
+Console-only transport, `info` level, JSON format with timestamp and error
+stacks. There are no file transports in the current implementation.
 
-const logger = winston.createLogger({
-  level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.errors({ stack: true }),
-    process.env.NODE_ENV === 'production'
-      ? winston.format.json()
-      : winston.format.prettyPrint()
-  ),
-  transports: [
-    new winston.transports.Console(),
-    new winston.transports.File({ filename: path.join(logsDir, 'error.log'), level: 'error' }),
-    new winston.transports.File({ filename: path.join(logsDir, 'combined.log') })
-  ]
-});
+### src/config/validateEnv.ts
 
-export default logger;
-```
+Requires `DATABASE_URL`, `REDIS_HOST`, `REDIS_PORT`, `CORS_ORIGINS`,
+`HASH_SECRET`, `GENESIS_HASH`, `INTERNAL_API_KEY` when the server starts
+directly. Exits 1 when any is missing.
 
 ---
 
 ## app.ts — Complete Express Setup
 
-```typescript
-import 'dotenv/config';
-import cors from 'cors';
-import express from 'express';
-import helmet from 'helmet';
-import morgan from 'morgan';
-import appsRouter from './routes/apps';
-import eventsRouter from './routes/events';
-import exportRouter from './routes/export';
-import healthRouter from './routes/health';
-import searchRouter from './routes/search';
-import verifyRouter from './routes/verify';
-import { apiKeyAuth } from './middleware/auth';
-import { errorHandler } from './middleware/errorHandler';
-import { requestId } from './middleware/requestId';
-import { validateEnv } from './config/validateEnv';
-import logger from './config/logger';
-import prisma from './config/db';
-import redis from './config/redis';
+Mounting order:
 
-export function createApp() {
-  const app = express();
+1. `helmet()`, `cors()` (allows `Content-Type, Authorization, x-owner-id, x-user-id, x-app-id, x-request-id`; exposes `x-request-id`), `requestId`, `express.json({ limit: '1mb' })`, Morgan (skip `/health`, includes `x-request-id`).
+2. `/health` — no auth.
+3. `/v1/apps` — dashboard-owner authorization (route-local, `INTERNAL_API_KEY` + owner headers). Not behind `apiKeyAuth`.
+4. `/v1/events` (events + search routers) — `apiKeyAuth` (customer app key only).
+5. `/v1/verify` — `dashboardOrApiKeyAuth` (customer key **or** internal + `x-owner-id` + `x-app-id`).
+6. `/v1/export` — `dashboardOrApiKeyAuth` (same dual credential).
+7. Global JSON 404 handler, then `errorHandler`.
 
-  app.use(helmet());
-  app.use(
-    cors({
-      origin: (process.env.CORS_ORIGINS ?? '')
-        .split(',')
-        .map((o) => o.trim())
-        .filter(Boolean),
-      methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'x-owner-id', 'x-user-id', 'x-request-id'],
-      exposedHeaders: ['x-request-id'],
-      credentials: true
-    })
-  );
-  app.use(requestId);
-  app.use(express.json({ limit: '1mb' }));
+Shutdown (`SIGTERM`/`SIGINT`/`unhandledRejection`/`uncaughtException`): close
+HTTP connections, `closeVerificationQueue()` (closes the local BullMQ handle —
+does not delete queued jobs), `prisma.$disconnect()`, `redis.disconnect()`,
+exit. The worker process shuts down via `worker.close()`.
 
-  app.use(
-    morgan(':req[x-request-id] :remote-addr - :remote-user [:date[clf]] ":method :url HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent"', {
-      stream: { write: (message) => logger.info(message.trim()) },
-      skip: (req) => req.path === '/health'
-    })
-  );
-
-  // Health check is unversioned — platform probes must not be behind /v1/
-  app.use('/health', healthRouter);
-
-  // App-management routes use INTERNAL_API_KEY plus owner headers.
-  app.use('/v1/apps', appsRouter);
-
-  // All routes below require a valid API key
-  app.use(apiKeyAuth);
-  app.use('/v1/events', eventsRouter);
-  app.use('/v1/events', searchRouter);
-  app.use('/v1/verify', verifyRouter);
-  app.use('/v1/export', exportRouter);
-
-  app.use((_req, res) => {
-    res.status(404).json({
-      success: false,
-      error: { message: 'Route not found', code: 'NOT_FOUND', statusCode: 404 }
-    });
-  });
-
-  app.use(errorHandler);
-
-  return app;
-}
-
-const app = createApp();
-
-if (require.main === module) {
-  validateEnv();
-  const PORT = Number.parseInt(process.env.PORT || '3000', 10);
-  const server = app.listen(PORT, () => {
-    logger.info(`API server running on port ${PORT}`);
-  });
-
-  async function shutdown(signal: string) {
-    logger.info(`${signal} received; starting graceful shutdown`);
-    server.closeAllConnections();
-    server.close(async () => {
-      logger.info('HTTP server closed');
-      await prisma.$disconnect();
-      redis.disconnect();
-      process.exit(0);
-    });
-    setTimeout(() => {
-      logger.error('Graceful shutdown timeout; forcing exit');
-      process.exit(1);
-    }, 10000).unref();
-  }
-
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-  process.on('unhandledRejection', (reason: unknown) => {
-    logger.error({ message: 'Unhandled promise rejection - shutting down', reason });
-    void shutdown('unhandledRejection');
-  });
-  process.on('uncaughtException', (err: Error) => {
-    logger.error({ message: 'Uncaught exception - shutting down', error: err.message, stack: err.stack });
-    void shutdown('uncaughtException');
-  });
-}
-
-export default app;
-```
-
-**Why middleware order matters:**
-1. `helmet()` first — sets secure HTTP headers before anything else runs
-2. `cors()` second — OPTIONS preflight must be handled before auth middleware
-3. Request ID middleware — assigns or propagates correlation IDs
-4. `express.json()` — body must be parsed before route handlers read it
-5. `morgan` — logs every request including auth failures; includes `:req[x-request-id]`
-6. `/health` and `/v1/apps` before `apiKeyAuth` — app routes use internal dashboard credentials
-7. `apiKeyAuth` — all routes mounted after this require a valid app API key
-8. `errorHandler` last — catches errors from every route and middleware above it
-
-**Why /health is not versioned:**
-Platform probes (Railway healthcheck, Docker HEALTHCHECK, load balancers) are configured once and don't follow API versioning. Versioning a health route creates operational friction with no benefit.
-
-**Why x-request-id is in both allowedHeaders and exposedHeaders:**
-`allowedHeaders` lets browsers send the header on cross-origin requests (upstream proxy correlation).
-`exposedHeaders` lets browser JavaScript read the response header value so the dashboard can surface the correlation ID in its own error reporting.
+**Why /health is not versioned:** platform probes (Docker HEALTHCHECK, Railway
+healthcheck, load balancers) are configured once and don't follow API
+versioning.
 
 ---
 
 ## TypeScript Types — Complete Definitions
 
 ### src/types/express.d.ts
-```typescript
-import type { App } from '@prisma/client';
 
-declare global {
-  namespace Express {
-    interface Request {
-      id: string;       // Correlation ID — set by middleware in app.ts
-      auditApp?: App;   // Set by apiKeyAuth middleware on protected routes
-    }
-  }
-}
-
-export {};
-```
+`req.id` / `req.requestId` (correlation ID), `req.auditApp?: Omit<App,
+'apiKey'>` — authenticated app data never carries the stored digest.
 
 ### src/types/index.ts
-```typescript
-import type { App } from '@prisma/client';
-import type { NextFunction, Request, Response } from 'express';
-import { z } from 'zod';
 
-export const IngestEventSchema = z.object({
-  actorId: z.string().min(1).max(255),
-  // Open string — not a closed enum. Clients define their own actor types.
-  // "device", "webhook", "bot" are all valid without requiring a service change.
-  actorType: z.string().min(1).max(100),
-  action: z.string().min(1).max(255),         // Convention: "resource.verb" e.g. "invoice.deleted"
-  resourceId: z.string().min(1).max(255),
-  resourceType: z.string().min(1).max(100),
-  metadata: z.record(z.unknown()).optional(),
-  ipAddress: z.string().ip().optional(),
-  userAgent: z.string().max(500).optional(),
-  // Optional deduplication token. Client generates a UUID before sending and
-  // includes it on every retry of the same logical event. Server returns the
-  // original entry on duplicate instead of inserting again.
-  idempotencyKey: z.string().min(1).max(255).optional()
-});
+Zod schemas: `IngestEventSchema` (open `actorType` string, 10 KB metadata cap,
+optional `idempotencyKey`), `SearchEventsSchema` (page max 1000, 90-day
+two-sided date rule), `ExportEventsSchema` (+ `format: json|csv`),
+`RegisterAppSchema`. Inferred aliases: `IngestEventInput`,
+`SearchEventsInput`, `ExportEventsInput`, `RegisterAppInput`.
 
-export const SearchEventsSchema = z.object({
-  actorId: z.string().optional(),
-  actorType: z.string().optional(),
-  action: z.string().optional(),
-  resourceId: z.string().optional(),
-  resourceType: z.string().optional(),
-  startDate: z.string().datetime().optional(),
-  endDate: z.string().datetime().optional(),
-  page: z.coerce.number().int().positive().default(1),
-  limit: z.coerce.number().int().min(1).max(100).default(50)
-});
+`HashPayload` field order is fixed (`appId, sequenceNumber, actorId, actorType,
+action, resourceId, resourceType, metadata, createdAt`) — `JSON.stringify`
+order is hash input. `ipAddress`/`userAgent`/`idempotencyKey` are excluded.
 
-export const ExportEventsSchema = SearchEventsSchema.extend({
-  format: z.enum(['json', 'csv']).default('json')
-});
+`VerificationResult` discriminated union (`valid: true` vs `valid: false` +
+`tamperedAt`). `ApiSuccess`/`ApiError`/`ApiResponse` envelopes.
+`ActivityEntry` Redis/endpoint subset. `AuthenticatedRequest`/`AsyncHandler`
+aliases.
 
-export const RegisterAppSchema = z.object({
-  name: z.string().min(1).max(100),
-  description: z.string().max(500).optional()
-});
+### src/services/verificationJobs.ts (single source of truth for jobs)
 
-export type IngestEventInput = z.infer<typeof IngestEventSchema>;
-export type SearchEventsInput = z.infer<typeof SearchEventsSchema>;
-export type ExportEventsInput = z.infer<typeof ExportEventsSchema>;
-export type RegisterAppInput = z.infer<typeof RegisterAppSchema>;
+`VerificationResultSchema` + `VerifyJobSchema` (status
+`pending|running|complete|failed`, phase `queued|running|retrying`,
+`attemptsMade`), inferred `VerifyJob`, `AcquireResult`, key helpers
+(`verify-job:{appId}:{jobId}`, `verify-active:{appId}`), atomic Lua
+acquire/release/renew, `startVerifyHeartbeat`, `saveVerifyJob` (TTL only on
+terminal states), `readVerifyJob`/`getVerifyJob`.
 
-// CRITICAL: Field order must never change — JSON.stringify is used as hash input.
-// Changing field order changes the hash output, which breaks verification for all
-// existing entries created before the change.
-export interface HashPayload {
-  appId: string;
-  sequenceNumber: number;
-  actorId: string;
-  actorType: string;
-  action: string;
-  resourceId: string;
-  resourceType: string;
-  metadata: Record<string, unknown> | null;
-  createdAt: string; // ISO 8601
-}
+### src/queues/verificationQueue.ts
 
-export type VerificationResult =
-  | { valid: true; entriesChecked: number; durationMs: number }
-  | {
-      valid: false;
-      entriesChecked: number;
-      durationMs: number;
-      tamperedAt: { sequenceNumber: number; entryId: string };
-    };
-
-// Async verification job stored in Redis
-export type VerifyJobStatus = 'pending' | 'complete' | 'failed';
-export interface VerifyJob {
-  jobId: string;
-  appId: string;
-  status: VerifyJobStatus;
-  startedAt: string;
-  completedAt?: string;
-  result?: VerificationResult;
-  error?: string;
-}
-
-export interface ApiSuccess<T> { success: true; data: T; }
-export interface ApiError {
-  success: false;
-  error: { message: string; code: string; statusCode: number; details?: unknown; };
-}
-export type ApiResponse<T> = ApiSuccess<T> | ApiError;
-
-export interface ActivityEntry {
-  id: string;
-  actorId: string;
-  actorType: string;
-  action: string;
-  resourceId: string;
-  resourceType: string;
-  metadata: Record<string, unknown> | null;
-  createdAt: string;
-}
-
-export type AuthenticatedRequest = Request & { auditApp: App };
-export type AsyncHandler = (req: Request, res: Response, next: NextFunction) => Promise<unknown>;
-```
+`VERIFICATION_QUEUE_NAME = 'verification'`, `VerificationJobData { appId,
+jobId, appName }`, default job options `attempts: 3`, exponential backoff 500
+ms, `removeOnComplete/removeOnFail: true`.
 
 ---
 
 ## Database Schema — Complete Prisma Definition
 
-```prisma
-generator client {
-  provider = "prisma-client-js"
-}
+Prisma `^5.22.0`, PostgreSQL provider, `binaryTargets = ["native",
+"debian-openssl-3.0.x"]`. Two models, no `User` table:
 
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
-}
+- `App`: UUID v7 `id`, `name`, `description?`, unique `apiKey` (HMAC digest),
+  indexed `ownerId` (GitHub user id), `isActive` default true, timestamps,
+  `auditLogs` relation, `@@map("apps")`.
+- `AuditLog`: UUID v7 `id`, UUID `appId` FK (`ON DELETE RESTRICT`, `ON UPDATE
+  CASCADE`), `actorId/actorType/action/resourceId/resourceType`, `metadata`
+  JSONB, `ipAddress?/userAgent?/idempotencyKey?`, `entryHash`, `previousHash`,
+  `sequenceNumber`, `createdAt`, `@@unique([appId, sequenceNumber])`,
+  `@@unique([appId, idempotencyKey], name: "unique_app_idempotency_key")`,
+  indexes on `(appId, createdAt/actorId/resourceId/action)`,
+  `@@map("audit_logs")`.
 
-model App {
-  id          String      @id @default(uuid(7)) @db.Uuid
-  name        String
-  description String?
-  apiKey      String      @unique // HMAC-SHA256 digest; raw key is returned only at creation/rotation
-  ownerId     String
-  isActive    Boolean     @default(true)
-  createdAt   DateTime    @default(now())
-  updatedAt   DateTime    @updatedAt
+Migration history (only these two):
 
-  auditLogs   AuditLog[]
+- `20260908202915_init` — tables, UUID columns, unique/index definitions, FK.
+- `20260908202916_add_immutability_trigger` — `prevent_audit_log_modification()`
+  + `audit_log_immutable` trigger (`BEFORE UPDATE OR DELETE`, raises).
 
-  @@index([ownerId])
-  @@map("apps")
-}
-
-model AuditLog {
-  id              String    @id @default(uuid(7)) @db.Uuid
-  appId           String    @db.Uuid
-
-  // Event data
-  actorId         String
-  actorType       String    // Open string — no enum constraint. "user", "device", "webhook", etc.
-  action          String
-  resourceId      String
-  resourceType    String
-  metadata        Json?
-  ipAddress       String?
-  userAgent       String?
-
-  // Idempotency — optional deduplication token scoped to (appId, idempotencyKey).
-  // Null for clients that don't send a key. PostgreSQL treats each null as distinct,
-  // so multiple null values do not violate the unique constraint.
-  idempotencyKey  String?
-
-  // Hash chain fields — DO NOT MODIFY after creation
-  entryHash       String
-  previousHash    String
-  sequenceNumber  Int
-
-  createdAt       DateTime  @default(now())
-
-  app             App       @relation(fields: [appId], references: [id])
-
-  @@unique([appId, sequenceNumber])
-  @@unique([appId, idempotencyKey], name: "unique_app_idempotency_key")
-  @@index([appId, createdAt])
-  @@index([appId, actorId])
-  @@index([appId, resourceId])
-  @@index([appId, action])
-  @@index([appId, sequenceNumber])
-  @@map("audit_logs")
-}
-```
-
-The idempotency field and UUID/sequence constraints are already represented in
-the checked-in Prisma migrations. Deploy existing migrations with
-`npm run prisma:migrate`; do not create a new migration merely to reproduce
-this context description.
-
-### Append-Only Trigger (raw SQL — not in schema.prisma)
-
-```sql
-CREATE OR REPLACE FUNCTION prevent_audit_log_modification()
-RETURNS trigger AS $$
-BEGIN
-  RAISE EXCEPTION 'audit_logs is append-only. UPDATE and DELETE are not permitted. Entry: %', OLD.id;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER audit_log_immutable
-  BEFORE UPDATE OR DELETE ON audit_logs
-  FOR EACH ROW
-  EXECUTE FUNCTION prevent_audit_log_modification();
-```
+Deploy with `npm run prisma:migrate`; do not invent tables, fields, indexes, or
+relationships.
 
 ---
 
 ## Middleware
 
-### src/middleware/validate.ts — Shared Validation Factory
-```typescript
-import type { NextFunction, Request, Response } from 'express';
-import type { ZodSchema } from 'zod';
+### Validation
 
-export function validate(field: 'body' | 'query', schema: ZodSchema) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const result = schema.safeParse(req[field]);
-    if (!result.success) {
-      return res.status(400).json({
-        success: false,
-        error: {
-          message: 'Validation failed',
-          code: 'VALIDATION_ERROR',
-          statusCode: 400,
-          details: result.error.flatten()
-        }
-      });
-    }
-    (req as any)[field] = result.data;
-    return next();
-  };
-}
-```
+Shared `validate(field, schema)` factory (`validateBody`/`validateQuery` thin
+wrappers). 400 `VALIDATION_ERROR` with flattened details; Zod strips unknown
+keys. Route-local Zod param parsing (app UUIDs, resourceId, verify jobId UUID)
+throws `ZodError`, mapped by `errorHandler` to the same 400 contract.
 
-`validateBody` and `validateQuery` are thin wrappers:
-```typescript
-// validateBody.ts
-export function validateBody(schema: ZodSchema) { return validate('body', schema); }
+### Authentication
 
-// validateQuery.ts
-export function validateQuery(schema: ZodSchema) { return validate('query', schema); }
-```
+**apiKeyAuth** (`/v1/events`, fallback for verify/export): `Authorization:
+Bearer <raw als_ key>` → HMAC digest (`HASH_SECRET`) → Redis
+`apikey:{digest}` (non-secret data, 600 s TTL) → PostgreSQL active-App lookup on
+miss/failure → `req.auditApp`. 401 `MISSING_API_KEY`/`INVALID_API_KEY`.
 
-### src/middleware/auth.ts — Key Points
+**dashboardOrApiKeyAuth** (`/v1/verify`, `/v1/export`): valid
+`INTERNAL_API_KEY` + `x-owner-id` + `x-app-id` → owned active-app lookup (403
+`DASHBOARD_AUTH_REQUIRED`/`APP_ACCESS_DENIED`) → `req.auditApp`; otherwise
+delegates to `apiKeyAuth`. `INTERNAL_API_KEY` is server-only; browsers never
+receive it.
 
-**apiKeyAuth:** Checks `Authorization: Bearer <raw-key>`, hashes it with the
-`HASH_SECRET` HMAC, and looks up the digest in PostgreSQL. The cached app object
-is stored in Redis at `apikey:{digest}` for `API_KEY_CACHE_TTL_SECONDS` (default
-600s). The raw key is never stored; it is returned only when an app is created
-or its key is rotated. Falls back to PostgreSQL on cache miss or Redis failure.
-Attaches app to `req.auditApp`.
+**getDashboardOwnerId/requireOwnerId** (`/v1/apps`): valid internal key +
+`x-owner-id` (else `x-user-id`) → owner scope; missing → 401
+`DASHBOARD_AUTH_REQUIRED`. No app key accepted here.
 
-**getDashboardOwnerId:** If `INTERNAL_API_KEY` is set and the request presents it
-as a Bearer token, returns the owner from `x-owner-id` or `x-user-id` headers.
-There is no development bypass in the current implementation. Missing internal
-credentials or owner headers fails closed.
+### errorHandler
 
-### src/middleware/errorHandler.ts — Key Points
+`ZodError` → 400; `AppError` (operational) → its status/message; everything else
+→ generic 500 (never leaks internals).
 
-Handles three error types in order:
-1. `ZodError` — returns 400 with `VALIDATION_ERROR`. Required because route-level
-   inline Zod parsing (e.g. `z.string().parse(req.params.resourceId)`) throws a
-   raw `ZodError`, not an `AppError`. Without this branch it would become a 500.
-2. `AppError` (isOperational: true) — returns the attached status code and message.
-3. Everything else — returns 500 with generic "Internal server error" (never leaks
-   internal error details to clients).
+### Rate limiting
 
-### src/middleware/rateLimiter.ts — Key Points
-
-Both limiters use app ID as the rate limit key (`req.auditApp?.id`), not IP address.
-This is correct for an API service — rate limiting by IP punishes clients behind NAT
-and doesn't reflect actual API key usage.
-
-Error messages are computed dynamically from the same constants used for `max` and
-`windowMs`, so they stay accurate when operators tune the limits via env vars.
+Process-local express-rate-limit, five instances: events 200/min, verify-start
+1/5 min (POST only; polls unlimited), apps mutations 30/min (owner-keyed), search
+100/min, export 10/min. Keys are app id (or derived owner) else IP. 429
+`RATE_LIMIT_EXCEEDED`. GET `/v1/apps` and `GET /v1/verify/:jobId` have no
+limiter.
 
 ---
 
 ## Analytics Queries
 
-```typescript
-// src/services/analyticsService.ts
-
-// getEventVolumeByDay uses $queryRaw with DATE_TRUNC + GROUP BY.
-// DO NOT rewrite this as prisma.auditLog.findMany() — fetching every row
-// into Node.js memory to count by day is an OOM bomb at any meaningful scale.
-// The database does one pass and returns 30 rows. Node.js receives 30 objects.
-
-export async function getEventVolumeByDay(appId: string): Promise<{ date: string; count: number }[]> {
-  const rows = await prisma.$queryRaw<Array<{ date: string; count: bigint }>>`
-    SELECT
-      DATE_TRUNC('day', created_at)::date::text AS date,
-      COUNT(*) AS count
-    FROM audit_logs
-    WHERE app_id = ${appId}
-      AND created_at >= NOW() - INTERVAL '30 days'
-    GROUP BY DATE_TRUNC('day', created_at)
-    ORDER BY DATE_TRUNC('day', created_at) ASC
-  `;
-  // PostgreSQL COUNT() returns BIGINT. The pg driver maps this to JavaScript BigInt.
-  // JSON.stringify cannot serialise BigInt — always convert with Number() before returning.
-  return rows.map((row) => ({ date: row.date, count: Number(row.count) }));
-}
-```
+`analyticsService.ts` keeps the `$queryRaw` `DATE_TRUNC` volume aggregation
+(database groups; 30 rows returned; `COUNT()` BigInt → `Number()`), plus
+top-actors/action-breakdown helpers behind a 60 s cache-aside layer
+(`analytics:*`). No backend route currently calls these functions.
 
 ---
 
 ## Activity Cache Service
 
-### Key design decisions in src/services/activityCache.ts
-
-**Single-entry writes (`cacheActivityEntry`):** Called from the POST /v1/events
-handler on every new ingestion. One Redis pipeline per call: ZADD + ZREMRANGEBYRANK
-+ EXPIRE. This is already optimal for the single-write case.
-
-**Bulk cache warm (`bulkCacheActivityEntries`, internal):** Called when the DB
-fallback path populates the cache from PostgreSQL. Batches all N ZADD commands into
-one pipeline with a single ZREMRANGEBYRANK and single EXPIRE. This is N+2 Redis
-commands in one round-trip, not 3N round-trips across N separate pipelines.
-
-**Why `bulkCacheActivityEntries` is not exported:** It is only correct to call when
-all entries belong to the same (appId, resourceId) sorted set. Exporting it would
-allow callers to use it incorrectly. The single-entry `cacheActivityEntry` handles
-all external callers.
-
-**Fallback pattern:** `getActivityFeed` tries Redis first. On any Redis error or
-empty result, it queries PostgreSQL directly and then awaits the bulk cache warm
-before returning. Awaiting (not fire-and-forget) ensures the cache is populated
-before the response goes out, so the next identical request hits cache.
+Keys `activity:{appId}:{resourceId}` (sorted set, score = ms timestamp, 50
+entries, 1 h TTL). Single writes pipeline ZADD+trim+expire; fallback warms via
+one bulk pipeline; `getActivityFeed` returns `{ entries, source:
+'cache'|'database' }` with PostgreSQL fallback and non-awaited warm.
+`clearActivityCache` exists but no route calls it.
 
 ---
 
@@ -699,98 +349,79 @@ before the response goes out, so the next identical request hits cache.
 
 ### CRITICAL implementation rules
 
-1. **Never reorder HashPayload fields.** `JSON.stringify` is used as hash input.
-   Field order changes = different hash = entire chain fails verification for all
-   existing entries.
+1. **Never reorder HashPayload fields.** `JSON.stringify` is hash input.
+2. **Always use Serializable isolation for chain writes** (plus unique
+   `(appId, sequenceNumber)`), with P2034 retry (3 attempts).
+3. **Handle P2002 for idempotency** — concurrent same-key inserts resolve via
+   the unique constraint; fetch the winner and return it (200, not 201).
+4. **Idempotency pre-check stays outside the transaction** (cheap point lookup;
+   constraint covers the race).
+5. **`ipAddress`/`userAgent`/`idempotencyKey` are not hashed** — the trigger is
+   their ordinary-write protection.
+6. **Canonicalize metadata** (recursive key sort; arrays keep order) before hashing.
+7. **Compare with timingSafeEqual** for both `previousHash` and `entryHash`.
 
-2. **Always use Serializable isolation for chain writes.** Under concurrent writes
-   at lower isolation levels, two transactions can both read the same "latest hash"
-   before either commits. Both compute their `previousHash` from the same value.
-   Both insert. Now two entries have identical `previousHash` — the chain is broken.
-   Serializable makes concurrent transactions behave as if they ran sequentially.
-
-3. **Retry on P2034.** Serializable isolation aborts one of the conflicting
-   transactions with a serialization failure (Prisma code P2034). The retry loop
-   converts this into a brief delay and re-attempt rather than a 500 to the client.
-   Three retries is sufficient for realistic burst traffic.
-
-4. **Handle P2002 for idempotency.** If two concurrent requests with the same
-   `idempotencyKey` both pass the pre-check (neither found an existing row) and
-   both proceed to insert, the DB unique constraint on `(appId, idempotencyKey)`
-   lets only one commit. The other gets P2002. Catch it, fetch the winning row,
-   return it as a deduplicated result.
-
-5. **Idempotency pre-check is outside the transaction.** The serializable
-   transaction is expensive. The pre-check is a cheap point-lookup that handles the
-   common case (sequential retries). The unique constraint handles the race condition
-   case (concurrent retries). Do not move the pre-check inside the transaction.
+`computeEntryHash = HMAC-SHA256(HASH_SECRET, previousHash +
+JSON.stringify(payload))` (hex). `verifyChain` scans in `sequenceNumber` order
+in `VERIFY_CHAIN_BATCH_SIZE` (500) batches and stops at the first mismatch.
 
 ---
 
-## Verification — Async Job Pattern
+## Verification — Durable BullMQ Job Pattern
 
-Chain verification is O(n) over all entries. Running it synchronously in the request
-cycle blocks a Node.js worker for the entire duration of the scan — potentially
-minutes for large chains. The solution is an async job pattern.
+Chain verification is O(n); it runs in a separate worker process, not in the
+request cycle and not via in-process `setImmediate` (that design is removed).
 
-### How it works
+`POST /v1/verify` (dual credential + verify limiter):
 
-`POST /v1/verify` starts a verification job:
-1. Generates a `jobId` (UUID).
-2. Writes a `VerifyJob` object with `status: 'pending'` to Redis at
-   `verify-job:{appId}:{jobId}` with TTL `VERIFY_JOB_TTL_SECONDS`.
-3. Fires `verifyChain(appId)` inside `setImmediate` — starts after the response
-   is sent, does not block it.
-4. Returns `202 Accepted` immediately with `{ jobId, status: 'pending', pollUrl }`.
+1. Generates a UUID `jobId`.
+2. Atomically acquires `verify-active:{appId}` via Lua (absent → set with
+   `VERIFY_ACTIVE_TTL_SECONDS`, default 3600 s; terminal reference → overwrite;
+   otherwise blocked). Simultaneous requests resolve to one 202 + one 409.
+3. Saves `pending`/`queued` VerifyJob at `verify-job:{appId}:{jobId}` (no TTL yet).
+4. Adds a durable BullMQ `verify-chain` job (`attempts: 3`, exponential backoff
+   500 ms). Enqueue failure → save `failed` (TTL), release sentinel, rethrow.
+5. Returns 202 `{ jobId, status: 'pending', startedAt, pollUrl }`; busy → 409
+   `JOB_IN_PROGRESS` with existing `jobId`/`pollUrl`.
 
-The `setImmediate` callback:
-- On success: updates Redis key with `status: 'complete'` and the full result.
-- On `result.valid === false`: calls `sendTamperAlert` (with `.catch` — never
-  void without a catch handler).
-- On error: updates Redis key with `status: 'failed'` and the error message. Logs
-  the error. Never becomes an unhandled promise rejection (entire body is in
-  try/catch).
+Worker (`npm run worker`, `concurrency: 1`):
 
-`GET /v1/verify/:jobId` polls for the result:
-- Validates `jobId` as a UUID with Zod (throws ZodError → 400 via errorHandler).
-- Reads `verify-job:{appId}:{jobId}` from Redis.
-- Returns 404 if the key does not exist (job expired or wrong appId).
-- Returns the full `VerifyJob` object on success.
+- Loads the persisted job; missing → warn + release sentinel + ack; already
+  terminal → ack.
+- Saves `running` with `attemptsMade = job.attemptsMade + 1`, starts the
+  heartbeat (renew every TTL/3, minimum 1 s; ownership-checked Lua EXPIRE).
+- Runs `verifyChain(appId)`: success → save `complete` (TTL
+  `VERIFY_JOB_TTL_SECONDS`, 3600 s) + release sentinel (ownership-checked Lua
+  DEL) + best-effort `sendTamperAlert` when invalid; error with retries left →
+  save `pending`/`retrying` (no TTL, no release) + rethrow for BullMQ retry;
+  error exhausted → save `failed` (TTL) + release + rethrow.
+- Shutdown via `worker.close()`; BullMQ records use `removeOnComplete/ Fail:
+  true` (the observable record is the Redis `verify-job:*` key).
 
-The rate limiter (`verifyRateLimiter`) is applied to `POST /` only. Polling
-`GET /:jobId` is cheap and must not be rate limited.
-
-### Why setImmediate and not a queue
-
-`setImmediate` is the simplest implementation that decouples the HTTP response from
-the computation. It is acceptable for a portfolio project. A production system would
-use a proper queue (BullMQ, pg-boss) so verification survives process restarts and
-can be distributed across workers. Note this in interviews — show you know the
-trade-off.
+`GET /v1/verify/:jobId` (dual credential, no limiter): UUID-parse the param,
+`readVerifyJob` in the authenticated app's namespace, enforce stored
+`appId` match (else 404 `JOB_NOT_FOUND`), schema-validate (else 500
+`JOB_DATA_CORRUPT`), return the full job (`pending/running/complete/failed`).
+A tampered chain is 200 `valid: false`, not an HTTP error.
 
 ---
 
 ## Dashboard Authentication and API Client
 
-NextAuth uses the existing GitHub provider configuration in
-`dashboard/lib/auth.ts`. The root route and dashboard layout use
-`getServerSession`; unauthenticated users are redirected to `/login`, which calls
-`signIn('github', { callbackUrl: '/dashboard' })`. The dashboard sidebar exposes
-NextAuth `signOut({ callbackUrl: '/login' })`.
+NextAuth GitHub (`dashboard/lib/auth.ts`); `session.user.id = token.sub` is the
+owner identity. Pages/layouts use `getServerSession`; unauthenticated users go
+to `/login` (`signIn('github')`, `signOut` in the sidebar).
 
-This GitHub session protects dashboard pages but does not replace backend API-key
-authentication. Server-side event/search requests use `DASHBOARD_APP_API_KEY` or
-the internal dashboard headers provided by `dashboard/lib/api.ts`; the verify and
-export client controls ask the user for an app API key. The Apps page currently
-lists active apps only; app creation, rotation, and deletion are API capabilities,
-not dashboard UI controls.
+Backend access is server-side only: `dashboard/lib/api.ts` (`server-only`) uses
+`API_URL` + `INTERNAL_API_KEY` + `x-owner-id` (GitHub id) + `x-app-id`, with
+`cache: 'no-store'`. The public `NEXT_PUBLIC_API_URL` is only for browser-safe
+URL building. Dashboard verify/poll/export proxy routes
+(`app/api/dashboard/...`) require a session (401 otherwise), validate UUID
+`appId`/`jobId` (400 otherwise), forward with the internal credential, map
+403/404/429 faithfully, and (for polls) reject `appId` mismatches with 404. The
+browser never sees `INTERNAL_API_KEY` or raw app keys.
 
-`dashboard/lib/api-url.ts` builds absolute URLs from an explicitly supplied base or
-`API_URL`/`NEXT_PUBLIC_API_URL`, prepends `/v1` when absent, and throws when no
-configured base exists. Server helpers prefer `API_URL`; browser components pass
-`NEXT_PUBLIC_API_URL`. `dashboard/scripts/load-env.cjs` loads the repository-root
-`.env` before `next start` when started from the dashboard directory. Server-only
-`API_URL` is not placed in Next's public `env` configuration.
+`dashboard/lib/api-url.ts` normalizes to `/v1` and requires a configured base.
 
 ---
 
@@ -799,218 +430,78 @@ configured base exists. Server helpers prefer `API_URL`; browser components pass
 All routes except `/health` are mounted under `/v1/`.
 
 ### POST /v1/events
-**Authentication:** `Authorization: Bearer <api-key>`
-**Rate limit:** `RATE_LIMIT_EVENTS_MAX` per `RATE_LIMIT_EVENTS_WINDOW_MS` (default 200/min)
 
-**Request body:**
-```json
-{
-  "actorId": "user_123",
-  "actorType": "user",
-  "action": "invoice.deleted",
-  "resourceId": "invoice_456",
-  "resourceType": "invoice",
-  "metadata": { "invoiceAmount": 4999, "deletedReason": "duplicate" },
-  "ipAddress": "192.168.1.1",
-  "userAgent": "Mozilla/5.0...",
-  "idempotencyKey": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
+**Authentication:** `Authorization: Bearer <app api-key>` only.
+**Rate limit:** 200/min (app-keyed).
 
-`idempotencyKey` is optional. When provided, the server deduplicates retries.
-`actorType` is a free string — not a closed enum.
-
-**Response — 201 Created (new entry):**
-```json
-{
-  "success": true,
-  "data": {
-    "entryId": "clxyz123abc",
-    "sequenceNumber": 47,
-    "entryHash": "a3f9b2c1d4e5...",
-    "createdAt": "2025-04-21T10:30:00.000Z"
-  }
-}
-```
-
-**Response — 200 OK (idempotent duplicate — same idempotencyKey seen before):**
-Same shape as 201. Status code 200 signals "already recorded" vs "just recorded".
-Clients implementing retry logic should treat both as success.
-
-**Error responses:** 400 (validation), 401 (missing/invalid key), 429 (rate limit), 500
-
----
+Body: `actorId/actorType/action/resourceId/resourceType` (bounded strings,
+open `actorType`), optional `metadata` object (10 KB cap), `ipAddress`,
+`userAgent` (500), `idempotencyKey`. **201** new entry
+`{ entryId, sequenceNumber, entryHash, createdAt }`; **200** same shape for
+idempotent duplicates. 400/401/429/500.
 
 ### GET /v1/events
-**Authentication:** `Authorization: Bearer <api-key>`
 
-**Query parameters:**
-```
-actorId, actorType, action, resourceId, resourceType   — exact match filters
-startDate, endDate                                      — ISO 8601 datetime
-page (default 1), limit (default 50, max 100)
-```
-
-**Response — 200 OK:**
-```json
-{
-  "success": true,
-  "data": {
-    "events": [{ "id": "...", "actorId": "...", "actorType": "...", "action": "...",
-                 "resourceId": "...", "resourceType": "...", "metadata": {},
-                 "ipAddress": "...", "userAgent": "...", "sequenceNumber": 47,
-                 "createdAt": "..." }],
-    "pagination": { "page": 1, "limit": 50, "total": 247, "totalPages": 5 }
-  }
-}
-```
-
-`entryHash` and `previousHash` are NOT returned. These are internal chain fields.
-
----
+**Authentication:** app key only. Filters: exact `actorId/actorType/action/
+resourceId/resourceType`, `startDate/endDate` (90-day two-sided rule), `page`
+(default 1, max 1000), `limit` (default 50, max 100). Newest-first OFFSET
+paging via one Prisma transaction (`findMany` + `count`). Omits
+`entryHash/previousHash/idempotencyKey`. 200 `{ events, pagination }`.
 
 ### GET /v1/events/activity/:resourceId
-**Authentication:** `Authorization: Bearer <api-key>`
 
-**Query parameters:** `limit` (default 20, max 50, validated via Zod schema)
+**Authentication:** app key only. Query `limit` (default 20, max 50).
+Redis-first (`source: cache`), PostgreSQL fallback + async warm (`source:
+database`).
 
-**Logic:**
-1. Check Redis sorted set `activity:{appId}:{resourceId}`
-2. Cache hit: return entries (source: "cache")
-3. Cache miss or Redis down: query PostgreSQL, bulk-warm the cache, return entries (source: "database")
+### POST /v1/verify — Enqueue verification job
 
-The `source` field in the response is useful for debugging and for demonstrating
-Redis is working during demos.
-
-The dashboard overview does not currently call `analyticsService.ts`. It derives
-its displayed total from the events response, calculates “Last 24h” from the
-returned sample, uses the first returned event for “Top action,” and displays chain
-status as `Unchecked`.
-
----
-
-### POST /v1/verify — Start verification job
-**Authentication:** `Authorization: Bearer <api-key>`
-**Rate limit:** `RATE_LIMIT_VERIFY_MAX` per `RATE_LIMIT_VERIFY_WINDOW_MS` (default 1/5min)
-
-**Response — 202 Accepted:**
-```json
-{
-  "success": true,
-  "data": {
-    "jobId": "550e8400-e29b-41d4-a716-446655440000",
-    "status": "pending",
-    "startedAt": "2025-04-21T10:30:00.000Z",
-    "pollUrl": "/v1/verify/550e8400-e29b-41d4-a716-446655440000"
-  }
-}
-```
-
-Job state is stored in Redis for `VERIFY_JOB_TTL_SECONDS` (default 3600s = 1 hour).
-
-If an active verification already exists for the app, the start request returns
-`409 JOB_IN_PROGRESS` with that job's `pollUrl` instead of starting a duplicate.
-
----
+**Authentication:** app key **or** dashboard internal + owner/app headers.
+**Rate limit:** 1/5 min (POST only). **202** `{ jobId, status: 'pending',
+startedAt, pollUrl }`; **409** `JOB_IN_PROGRESS` with existing `jobId/pollUrl`.
+Job/sentinel TTLs above; BullMQ durable.
 
 ### GET /v1/verify/:jobId — Poll verification result
-**Authentication:** `Authorization: Bearer <api-key>`
-**Rate limit:** None — polling is cheap.
 
-**Response — 200 OK (job pending):**
-```json
-{ "success": true, "data": { "jobId": "...", "appId": "...", "status": "pending", "startedAt": "..." } }
-```
-
-**Response — 200 OK (job complete, chain valid):**
-```json
-{
-  "success": true,
-  "data": {
-    "jobId": "...", "appId": "...", "status": "complete",
-    "startedAt": "...", "completedAt": "...",
-    "result": { "valid": true, "entriesChecked": 1247, "durationMs": 843 }
-  }
-}
-```
-
-**Response — 200 OK (job complete, chain tampered):**
-```json
-{
-  "success": true,
-  "data": {
-    "jobId": "...", "appId": "...", "status": "complete",
-    "startedAt": "...", "completedAt": "...",
-    "result": {
-      "valid": false, "entriesChecked": 534, "durationMs": 412,
-      "tamperedAt": { "sequenceNumber": 534, "entryId": "clxyz789def" }
-    }
-  }
-}
-```
-
-**Response — 404 (jobId not found or expired):**
-```json
-{ "success": false, "error": { "message": "Verification job not found", "code": "JOB_NOT_FOUND", "statusCode": 404 } }
-```
-
-A tampered chain is not a server error — it is a successful detection. Return 200
-with `result.valid: false`. The information itself is the response.
-
----
+**Authentication:** same dual credential; app-scoped namespace + stored
+`appId` check. **200** full job (`pending/running/complete/failed`, invalid
+chains as `valid: false`); **400** malformed UUID; **404** `JOB_NOT_FOUND`;
+**500** `JOB_DATA_CORRUPT`. No rate limit.
 
 ### GET /v1/export
-**Authentication:** `Authorization: Bearer <api-key>`
 
-**Query parameters:** Same as GET /v1/events, plus:
-```
-format=csv|json    (default: json)
-```
-
-**Implementation details:**
-- Both CSV and JSON formats stream the response using cursor-based pagination in
-  batches of 500. Neither format loads all rows into memory.
-- JSON export is capped at `JSON_EXPORT_MAX_ROWS` (default 10,000). If the cap is
-  hit, the response includes `"truncated": true` and `"totalFetched": N`. Clients
-  that need more than 10,000 rows should use `format=csv`, which has no row cap.
-- Both formats order results chronologically ascending (oldest first). This is the
-  correct order for export files opened in Excel, fed into SIEMs, or reviewed by
-  compliance auditors.
-
----
+**Authentication:** same dual credential as verify. Query: search filters +
+`format=json|csv` (default json; page/limit validated but unused). Streams
+chronologically ascending in 500-row cursor batches. CSV uncapped with formula
+protection; JSON capped at `JSON_EXPORT_MAX_ROWS` (10,000) with
+`truncated/totalFetched`. Attachment filenames include the app id.
 
 ### GET /v1/apps
-**Authentication:** `Authorization: Bearer <INTERNAL_API_KEY>` plus `x-owner-id` or
-`x-user-id`. This is backend dashboard-owner authentication, separate from the
-NextAuth session.
-**Note:** Returns only active apps (`isActive: true`). Soft-deleted apps are excluded.
+
+**Authentication:** `Bearer <INTERNAL_API_KEY>` + `x-owner-id`/`x-user-id`. No
+limiter. Returns only active apps with audit counts; no keys/owner ids.
 
 ### POST /v1/apps
-Registers an app for the authenticated owner and returns the raw API key once.
-The database stores only its HMAC-SHA256 digest.
+
+Internal dashboard auth + 30/min limiter. Validated `name/description`.
+Creates the app for that owner, stores only the key digest, returns the raw
+`als_` key once (201).
 
 ### POST /v1/apps/:id/rotate-key
-Replaces the app key and returns the new raw key once. The old key is invalidated
-and its digest cache entry is cleared.
+
+Internal auth + limiter; UUID id scoped to owner (`APP_NOT_FOUND` otherwise).
+Stores the new digest, clears the old digest cache entry, returns
+`newApiKey` once (200).
 
 ### DELETE /v1/apps/:id
-Soft-deletes the app by setting `isActive: false`, clears the digest cache, and
-returns 204. The app's audit logs are preserved by the append-only design.
 
----
+Internal auth + limiter; UUID id scoped to owner. Soft-deletes
+(`isActive: false`), clears the digest cache entry, preserves audit logs, 204.
 
 ### GET /health (unversioned)
-**Authentication:** None.
 
-**Response — 200 OK:**
-```json
-{ "status": "ok", "timestamp": "...", "dependencies": { "postgresql": "connected", "redis": "connected" } }
-```
-
-**Response — 503 Degraded:**
-```json
-{ "status": "degraded", "timestamp": "...", "dependencies": { "postgresql": "connected", "redis": "error: connection refused" } }
-```
+No auth. 200 `ok` / 503 `degraded` with per-dependency (`postgresql`, `redis`)
+status and ISO timestamp (3 s per-check timeout).
 
 ---
 
@@ -1030,12 +521,11 @@ REDIS_PORT=6379
 REDIS_PASSWORD=
 
 # Security
-HASH_SECRET="your-256-bit-secret-here"   # HMAC chain signing key. Set ONCE. Never change after first entry.
-GENESIS_HASH="audit-log-genesis"          # Fixed string used as previousHash for the first entry per app.
+HASH_SECRET="your-256-bit-secret-here"   # HMAC chain + API-key digest key. Set ONCE. Never change after first entry.
+GENESIS_HASH="audit-log-genesis"          # previousHash for the first entry per app.
 
-# Internal API key — shared secret between Next.js dashboard and Express API.
-# Dashboard server components send this in Authorization header.
-# NOT the same as a client app's API key.
+# Internal API key — shared secret between Next.js dashboard (server-only) and Express API.
+# Sent as Bearer with x-owner-id (+ x-app-id for verify/export). Never sent to browsers.
 INTERNAL_API_KEY="your-internal-api-key-here"
 
 # NextAuth (dashboard OAuth)
@@ -1051,10 +541,10 @@ ALERT_EMAIL_TO="you@yourdomain.com"
 
 # Rate limiting
 CORS_ORIGINS="http://localhost:3001"
-RATE_LIMIT_EVENTS_WINDOW_MS=60000    # 1 minute window for POST /v1/events
-RATE_LIMIT_EVENTS_MAX=200            # Max events per window per API key
-RATE_LIMIT_VERIFY_WINDOW_MS=300000   # 5 minute window for POST /v1/verify
-RATE_LIMIT_VERIFY_MAX=1              # Max verify jobs per window per API key
+RATE_LIMIT_EVENTS_WINDOW_MS=60000
+RATE_LIMIT_EVENTS_MAX=200
+RATE_LIMIT_VERIFY_WINDOW_MS=300000
+RATE_LIMIT_VERIFY_MAX=1
 RATE_LIMIT_APPS_WINDOW_MS=60000
 RATE_LIMIT_APPS_MAX=30
 RATE_LIMIT_SEARCH_WINDOW_MS=60000
@@ -1063,260 +553,160 @@ RATE_LIMIT_EXPORT_WINDOW_MS=60000
 RATE_LIMIT_EXPORT_MAX=10
 
 # Redis cache config
-API_KEY_CACHE_TTL_SECONDS=600        # How long API key lookups are cached in Redis
-ACTIVITY_CACHE_MAX_ENTRIES=50        # Max events stored per resource in Redis sorted set
-ACTIVITY_CACHE_TTL_SECONDS=3600      # TTL on activity cache keys (1 hour)
+API_KEY_CACHE_TTL_SECONDS=600
+ACTIVITY_CACHE_MAX_ENTRIES=50
+ACTIVITY_CACHE_TTL_SECONDS=3600
 MOCK_API_KEY="api-key-used-by-mock-producer"
 
 # Verify job config
-VERIFY_JOB_TTL_SECONDS=3600          # How long verification job results live in Redis (1 hour)
+VERIFY_JOB_TTL_SECONDS=3600          # Terminal job-state TTL
+VERIFY_ACTIVE_TTL_SECONDS=3600       # Sentinel TTL + heartbeat basis (code default; absent from .env.example)
 
 # Export config
-JSON_EXPORT_MAX_ROWS=10000           # Row cap for JSON exports. Clients needing more should use CSV.
+JSON_EXPORT_MAX_ROWS=10000
 
 # Hash chain verification batch size
-VERIFY_CHAIN_BATCH_SIZE=500          # Rows fetched per batch during verifyChain
+VERIFY_CHAIN_BATCH_SIZE=500
 
-# Dashboard (Vercel)
+# Dashboard (Vercel planned)
 NEXT_PUBLIC_API_URL="https://your-railway-api-url.railway.app"
 API_URL="https://your-railway-api-url.railway.app"
 ```
 
 The API validates `DATABASE_URL`, `REDIS_HOST`, `REDIS_PORT`, `CORS_ORIGINS`,
 `HASH_SECRET`, `GENESIS_HASH`, and `INTERNAL_API_KEY` when started directly.
-`ALLOW_DASHBOARD_DEV_AUTH` and `ENABLE_API_KEY_CACHE_IN_TESTS` are not used by
-the current implementation.
+`DASHBOARD_OWNER_ID`, `ALLOW_DASHBOARD_DEV_AUTH`, and
+`ENABLE_API_KEY_CACHE_IN_TESTS` are not used and must not be documented as
+behavior. CI uses deterministic `HASH_SECRET`/`INTERNAL_API_KEY` values.
 
 ---
 
 ## Transaction Safety — The Race Condition Problem
 
-**The problem:** Two requests arrive simultaneously for the same app. Both read the
-latest hash before either commits. Both compute their `previousHash` from the same
-value. Both insert. Two entries now share an identical `previousHash` — the chain
-is broken at that point.
+**The problem:** two concurrent ingestions for one app can both read the same
+tail hash, compute the same `previousHash`, and insert — breaking the chain.
 
-**The solution:** Serializable isolation + retry loop.
-
-```typescript
-for (let attempt = 1; attempt <= 3; attempt++) {
-  try {
-    const entry = await prisma.$transaction(async (tx) => {
-      const latest = await tx.auditLog.findFirst({
-        where: { appId },
-        orderBy: { sequenceNumber: 'desc' },
-        select: { entryHash: true, sequenceNumber: true }
-      });
-
-      const previousHash = latest?.entryHash ?? GENESIS_HASH;
-      const sequenceNumber = (latest?.sequenceNumber ?? 0) + 1;
-      const createdAt = new Date();
-      const payload = buildHashPayload({ appId, sequenceNumber, ...input, createdAt });
-      const entryHash = computeEntryHash(previousHash, payload);
-
-      return tx.auditLog.create({ data: { ...input, idempotencyKey: input.idempotencyKey ?? null,
-        entryHash, previousHash, sequenceNumber, createdAt } });
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
-
-    return { entry, created: true };
-  } catch (err) {
-    if (err instanceof Prisma.PrismaClientKnownRequestError) {
-      if (err.code === 'P2034' && attempt < 3) continue; // Serialization failure — retry
-      if (err.code === 'P2002' && input.idempotencyKey) {
-        // Concurrent retry race — fetch the winning row
-        const existing = await prisma.auditLog.findFirst({ where: { appId, idempotencyKey: input.idempotencyKey } });
-        if (existing) return { entry: existing, created: false };
-      }
-    }
-    throw err;
-  }
-}
-```
+**The solution:** Serializable isolation + retry loop (3 attempts) + unique
+`(appId, sequenceNumber)` + idempotent P2002 handling, exactly as implemented
+in `src/routes/events.ts`. The idempotency pre-check stays outside the
+transaction; the constraint covers the concurrent race.
 
 ---
 
 ## Testing Strategy
 
-The current Jest suite is:
+Jest + Supertest against real PostgreSQL and Redis:
 
-* `hashChain.test.ts`: hash determinism, payload ordering, clean-chain verification,
-  empty chains, and tamper detection.
-* `apiKey.test.ts`: HMAC digest storage, Redis cache behavior, invalid keys, key
-  rotation, and deactivation invalidation.
-* `events.test.ts`: event ingestion and API-key authorization contracts.
-* `search.test.ts`: event search/filter behavior.
-* `activityCache.test.ts`: Redis activity-cache behavior and database fallback.
-* `verify.test.ts`: asynchronous verification job start, polling, completion, and
-  failure/tamper behavior.
+* `hashChain.test.ts`: determinism, ordering, clean/tampered/empty chains.
+* `apiKey.test.ts`: HMAC digest storage, cache behavior, invalid keys, rotation, deactivation.
+* `events.test.ts`: ingestion and API-key authorization contracts.
+* `search.test.ts`: search/filter behavior.
+* `activityCache.test.ts`: activity cache and database fallback.
+* `verify.test.ts`: BullMQ enqueue, polling, 409/dedup under concurrency, dashboard owner/app scoping, tamper detection (uses a live worker; pauses it for contention tests).
+* `verificationWorker.test.ts`: retry-then-complete, terminal failure, heartbeat renewal, sentinel ownership.
 
-The suite is run with `npm test`; it depends on the configured PostgreSQL and Redis
-services. Dashboard validation currently uses its separate `typecheck` and `build`
-scripts; there is no dashboard Jest suite.
+Run with `npm test` (`--runInBand` in CI). Dashboard validation uses its
+separate `typecheck`/`build`; there is no dashboard Jest suite.
 
 ---
 
 ## Deployment Architecture
 
 ```
-[Vercel]
-  └── Next.js dashboard
-  ├── Server-rendered authenticated dashboard pages
-      ├── API routes for NextAuth OAuth callback
+[Vercel — planned, not automated]
+  └── Next.js dashboard (NextAuth GitHub)
+      ├── Server proxies attach INTERNAL_API_KEY + owner/app headers
       └── Calls Railway API at /v1/* for all data
 
-[Railway — Express API]
-  └── Node.js process
-      ├── GET  /health              (unversioned)
-      ├── GET  /v1/apps
-      ├── POST /v1/apps
-      ├── POST /v1/apps/:id/rotate-key
-      ├── DELETE /v1/apps/:id
-      ├── POST /v1/events
-      ├── GET  /v1/events
-      ├── GET  /v1/events/activity/:resourceId
-      ├── POST /v1/verify
-      ├── GET  /v1/verify/:jobId
-      └── GET  /v1/export
-
-[Railway — PostgreSQL]
-  └── audit_logs + apps tables with append-only trigger
-
-[Railway — Redis]
-  └── API key cache (apikey:*)
-      Activity sorted sets (activity:*)
-      Verify job state (verify-job:*)
+[Railway — planned, not automated]
+  ├── Express API (Node 20, non-root production image, /health check)
+  │     ├── GET  /health
+  │     ├── GET/POST /v1/apps (+ rotate/delete)
+  │     ├── POST /v1/events, GET /v1/events(+activity)
+  │     ├── POST /v1/verify, GET /v1/verify/:jobId (BullMQ enqueue + poll)
+  │     └── GET  /v1/export
+  ├── Verification worker (same image, worker command, concurrency 1)
+  ├── PostgreSQL (apps + audit_logs + append-only trigger)
+  └── Redis (apikey:*, activity:*, verify-job:*, verify-active:*, BullMQ keys)
 ```
 
-**Internal communication:** Vercel dashboard calls Railway API over HTTPS using
-`API_URL` (server components) and `NEXT_PUBLIC_API_URL` (client components).
-
-For local orchestration, `docker-compose.yml` starts only PostgreSQL and Redis;
-it does not start the API and does not define health checks. `Dockerfile` uses a
-two-stage Node 20 Alpine build, generates Prisma, compiles the API, and runs
-`npx prisma migrate deploy && node dist/app.js` in the production image.
+**Local (implemented):** `docker-compose.yml` runs `postgres` (15, healthy),
+`redis` (7-alpine append-only, healthy), `api` (production image, port 3000,
+healthy dependencies), and `worker` (production image, worker command,
+healthcheck disabled). `Dockerfile` is a two-stage Node 20 bookworm-slim build
+(OpenSSL in both stages, Prisma generate + `tsc`, `npm ci --omit=dev`,
+non-root `node` user, `/health` HEALTHCHECK, default `node dist/app.js`).
 
 ---
 
 ## GitHub Actions CI
 
-```yaml
-name: Production validation
-on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
-
-jobs:
-  validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '20', cache: 'npm' }
-      - run: npm ci
-      - run: npx prisma generate
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm run build
-      - run: npm ci
-        working-directory: dashboard
-      - run: npm run typecheck
-        working-directory: dashboard
-      - run: npm run build
-        working-directory: dashboard
-```
+Workflow `CI`, triggers `push`/`pull_request` on `main`/`master`, one job
+(`Test & Build` on `ubuntu-latest`) with `postgres:15` and `redis:7-alpine`
+services. Deterministic CI-only secrets (`HASH_SECRET`,
+`INTERNAL_API_KEY`, raised verify/events limits). Steps: checkout → Node 20
+(`cache: npm`) → `npm ci` → `prisma generate` → `typecheck` → `lint` →
+`prisma migrate deploy` → `jest --runInBand` → production `build` → `git diff
+--check`. There is no dashboard job and no deploy step — CI validates; it does
+not ship.
 
 ---
 
 ## Key Interview Questions and Exact Answers
 
 **Q: Why is the audit log tamper-proof?**
-A: Every entry's hash is computed from the previous entry's hash plus the current entry's data. Changing any field in any entry changes that entry's hash, but the next entry's stored hash was computed using the old value. Every entry after the modified one is also invalid. The verification endpoint recomputes every hash from scratch and finds the exact break point.
+A: Every entry's HMAC covers the previous entry's hash plus the current payload. Changing any hashed field changes that entry's hash, invalidating every later link. Verification recomputes the whole chain and reports the first break. Un-hashed columns rely on the append-only trigger.
 
-**Q: Why use a PostgreSQL trigger for append-only instead of checking in application code?**
-A: Application code can have bugs that accidentally call delete. A compromised service account could bypass application checks. Someone with database credentials can run raw SQL directly. A PostgreSQL trigger fires at the engine level — no code path, no SQL query, no database client can bypass it.
+**Q: Why a PostgreSQL trigger instead of application checks?**
+A: Application code can have bugs or be bypassed; raw SQL with DB credentials bypasses it entirely. The trigger fires at the engine level for every UPDATE/DELETE.
 
-**Q: Why timingSafeEqual instead of === for hash comparison?**
-A: String comparison with === short-circuits at the first non-matching character. An attacker who can measure tiny differences in server response time can exploit this — probing byte by byte, measuring which guesses take slightly longer before failing. timingSafeEqual always takes the same amount of time regardless of where the mismatch occurs.
+**Q: Why timingSafeEqual instead of ===?**
+A: `===` short-circuits on the first differing byte, leaking timing information. timingSafeEqual compares in constant time for equal-length inputs.
 
 **Q: Why Redis sorted sets for the activity cache?**
-A: Sorted sets are ordered by score — I use the event timestamp as the score. ZREVRANGE gives me the N most recent entries in one command. ZREMRANGEBYRANK lets me trim to a maximum size in one command. A list has no native trim-from-oldest. A hash has no ordering. The sorted set is the right data structure for this pattern.
+A: Timestamp scores give the N most recent entries in one ZREVRANGE; ZREMRANGEBYRANK trims in one command. Correct structure for a capped recency feed.
 
-**Q: Why does the transaction use Serializable isolation?**
-A: The hash chain requires that each entry's previousHash is the hash of the immediately preceding entry. Under concurrent writes at lower isolation levels, two transactions can both read the same "latest hash" before either commits, compute identical previousHash values, and both insert successfully — breaking the chain. Serializable makes concurrent transactions behave as if they ran sequentially.
+**Q: Why Serializable isolation?**
+A: Concurrent writers would otherwise read the same tail and fork the chain. Serializable forces an effective sequential order (loser gets P2034 and retries).
 
-**Q: What happens if the Redis activity cache goes down?**
-A: The service degrades gracefully. The getActivityFeed function falls back to a direct PostgreSQL query if Redis is unavailable. The activity feed is slower but functional. Redis is an optimisation layer, not a hard dependency for correctness.
+**Q: What happens if Redis goes down?**
+A: Caches degrade gracefully (API-key/activity/analytics fall back to PostgreSQL). Verification polling needs Redis; BullMQ delivery stalls until Redis returns.
 
-**Q: What happens if a client retries a POST /v1/events request?**
-A: If the client sends an `idempotencyKey`, the server detects the duplicate and returns the original entry's data with a 200 status code instead of inserting again. Without an idempotency key, retries create duplicate entries. Clients should always provide an idempotency key if they implement any retry logic.
+**Q: What happens on a POST /v1/events retry?**
+A: With an `idempotencyKey`, the server returns the original entry (200). Without one, retries insert duplicates. The unique constraint makes even concurrent retries safe.
 
-**Q: Why is chain verification now asynchronous?**
-A: Verification is O(n) over all entries. For a chain with 500k entries, it could take minutes. Running it synchronously blocks a Node.js worker for the entire scan duration. The async job pattern — `POST /v1/verify` returns 202 immediately, `GET /v1/verify/:jobId` polls for the result — decouples HTTP response time from computation time. The rate limiter prevents abuse; the async design prevents denial-of-service from legitimate use.
+**Q: Why is verification asynchronous and worker-based?**
+A: Verification is O(n) and must not block HTTP workers. The API persists state and enqueues durably; a separate worker scans with heartbeated sentinel ownership, retries with backoff, and survives API restarts. The 1/5-min start limiter plus the atomic sentinel prevent abuse and duplicates.
 
-**Q: How would you scale this for very high event volume?**
-A: Three changes. First, the hash chain computation already uses Serializable transactions which serialize concurrent writes — for very high throughput you would shard by appId across multiple PostgreSQL instances since each app's chain is independent. Second, partition the audit_logs table by appId — each app's data is isolated, queries don't scan other apps' partitions. Third, incremental chain verification — store the last verified checkpoint (sequenceNumber + hash) in Redis and verify only new entries on each job run, making verification O(new entries) instead of O(all entries).
+**Q: How would you scale for very high event volume?**
+A: Shard chains by appId (independent), partition `audit_logs` by app, and add incremental verification checkpoints (verify only new entries since the last checkpoint).
 
-**Q: Why is actorType a free string instead of an enum?**
-A: The service is designed for any application to plug into. Hardcoding `['user', 'admin', 'service', 'system']` means a client building an IoT platform can't log a 'device' actor type without a service redeploy. The hash payload already treats actorType as a plain string. The database stores it as a VARCHAR. The enum existed only in Zod validation — removing it costs nothing and makes the service genuinely general-purpose.
+**Q: Why is actorType a free string?**
+A: Any client app must be able to log its own actor kinds without a service redeploy; DB/hash already treat it as a string.
 
 ---
 
 ## Common Mistakes to Avoid
 
-1. **Never change HashPayload field order** — JSON.stringify order = hash input. Reordering = different hash = chain breaks on next verification.
-
-2. **Keep NextAuth and backend API authentication separate** — GitHub OAuth protects dashboard pages, while API calls still require the configured internal or app API credentials.
-
-3. **Never change HASH_SECRET after the first entry is created** — All existing hashes were computed with the old secret. Verification will fail for every entry. Treat this like a database encryption key — set it once before first use.
-
-4. **Always use $queryRaw for date aggregations** — Prisma groupBy() does not support date functions. Fetching all rows to count in Node.js is an OOM risk at any real scale.
-
-5. **Always test the immutability trigger before relying on it** — After migration, run `DELETE FROM audit_logs LIMIT 1` in a DB client. Confirm it throws. If it doesn't, the trigger didn't apply.
-
-6. **Test chain verification with actual tampering** — Don't only test a clean chain. Manually UPDATE one row's metadata and confirm verification returns `valid: false` with the correct `sequenceNumber`. This is your demo. It must work.
-
-7. **Use `cache: 'no-store'` in Next.js server component fetches** — Audit logs are real-time. Next.js caches fetch responses by default. Without no-store, the dashboard shows stale data.
-
-8. **Provide idempotencyKey in any client that retries** — Without it, network retries create phantom duplicate events in the audit trail.
+1. **Never change HashPayload field order** — JSON order is hash input.
+2. **Keep NextAuth and backend credentials separate** — GitHub sessions guard dashboard pages/proxies; backend calls still need internal or app keys.
+3. **Never expose INTERNAL_API_KEY to browsers** — dashboard use stays in `server-only` code with `API_URL`.
+4. **Never change HASH_SECRET after the first entry** — chains and stored digests both break.
+5. **Always use $queryRaw for date aggregations** — no full-table fetch into Node memory.
+6. **Test the trigger and tampering end-to-end** — disable trigger, mutate, re-enable, verify `valid: false` at the right sequence.
+7. **Use `cache: 'no-store'` in dashboard server fetches** — audit data is real-time.
+8. **Provide idempotencyKey on retried ingestion** — else retries duplicate.
+9. **Never delete BullMQ state in API shutdown** — close the handle only; the worker owns consumption.
+10. **Always release/renew the sentinel by owner jobId** — unconditional DEL/EXPIRE would steal another job's slot.
 
 ---
 
 ## Resume Bullet Points
 
 ```
-Audit Log Service | Node.js, TypeScript, PostgreSQL, Redis, Next.js
-
-• Built a tamper-proof audit trail service using HMAC-SHA256 hash chain where each
-  entry is cryptographically linked to the previous one — modifying any entry breaks
-  the chain at that exact position, detectable via timing-safe comparison
-
-• Enforced append-only immutability at the PostgreSQL engine level via trigger that
-  rejects UPDATE and DELETE — survives application bugs, compromised accounts, and
-  direct SQL access unlike application-level guards
-
-• Implemented exactly-once event ingestion using optional idempotency keys with a
-  composite unique index on (appId, idempotencyKey) — concurrent retries handled via
-  P2002 catch-and-fetch, sequential retries via pre-check before the transaction
-
-• Moved O(n) chain verification off the request cycle using an async job pattern —
-  POST returns 202 immediately, GET polls job state from Redis; eliminates worker
-  blocking regardless of chain size
-
-• Served resource activity feeds from Redis sorted sets scored by timestamp — one
-  ZREVRANGE command per request, bulk cache warm on DB fallback using a single
-  pipeline instead of N round-trips
-
-• Streamed large CSV and JSON exports using cursor-based pagination in 500-row batches
-  — constant memory usage regardless of result set size, JSON capped at configurable
-  row limit with truncation flag
-
-• Used Serializable transaction isolation for sequential chain writes with P2034
-  retry loop — prevents concurrent requests from computing identical previousHash
-  values and breaking chain integrity under load
-
-• Deployed on Railway (Express API + PostgreSQL + Redis) and Vercel (Next.js) with
-  GitHub Actions CI running integration tests against live PostgreSQL and Redis on
-  every push
+Audit Log Service | Node.js, TypeScript, PostgreSQL, Redis, BullMQ, Next.js
+- Tamper-evident audit API with HMAC hash chains, Serializable ingestion, and DB-level append-only enforcement.
+- Durable BullMQ verification worker with atomic Redis sentinel, heartbeating, retries, and tamper alerts.
+- Dual auth: HMAC-digest app API keys plus server-only dashboard credentials scoped by GitHub owner identity.
+- Dockerized api/worker/postgres/redis with non-root production image; CI-gated typecheck/lint/tests/build.
 ```
