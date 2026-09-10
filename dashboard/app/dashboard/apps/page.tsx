@@ -17,8 +17,13 @@ type AppsResponse = {
 };
 
 export default async function AppsPage() {
-  const response = await dashboardFetch<AppsResponse>('/v1/apps');
-  const apps = response?.data.apps ?? [];
+  let apps: AppsResponse['data']['apps'] = [];
+  try {
+    const response = await dashboardFetch<AppsResponse>('/v1/apps');
+    apps = response.data.apps;
+  } catch {
+    apps = [];
+  }
 
   return (
     <div className="grid">

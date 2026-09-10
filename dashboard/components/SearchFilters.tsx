@@ -15,6 +15,10 @@ export function SearchFilters() {
     const formData = new FormData(event.currentTarget);
     const params = new URLSearchParams();
 
+    // Preserve the explicitly selected app context across searches.
+    const appId = searchParams.get('appId');
+    if (appId) params.set('appId', appId);
+
     for (const field of fields) {
       const value = String(formData.get(field) || '');
       if (value) params.set(field, value);

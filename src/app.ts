@@ -70,8 +70,19 @@ export function createApp() {
    */
   app.use('/v1/apps', appsRouter);
 
+  /*
+   * Read-only event/search/activity routes accept either a customer app key
+   * (apiKeyAuth fallback) or dashboard owner/app credentials, using the same
+   * ownership-verified model as verify/export.
+   *
+   * The read router is mounted FIRST on purpose: Express executes each mount's
+   * auth middleware for every subpath, so a customer-only gate mounted first
+   * would reject dashboard reads before they reach the search router.
+   * Ingestion (POST /) still falls through to eventsRouter behind apiKeyAuth,
+   * so customer write authentication is unchanged.
+   */
+  app.use('/v1/events', dashboardOrApiKeyAuth, searchRouter);
   app.use('/v1/events', apiKeyAuth, eventsRouter);
-  app.use('/v1/events', apiKeyAuth, searchRouter);
   app.use('/v1/verify', dashboardOrApiKeyAuth, verifyRouter);
   app.use('/v1/export', dashboardOrApiKeyAuth, exportRouter);
 

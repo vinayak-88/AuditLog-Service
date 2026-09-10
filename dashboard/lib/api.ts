@@ -68,10 +68,24 @@ export async function dashboardRequest(
 export async function dashboardFetch<T>(
   path: string,
   options: ApiOptions = {}
-): Promise<T | null> {
+): Promise<T> {
   const response = await dashboardRequest(path, options);
 
-  if (!response.ok) return null;
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const body = (await response.json()) as
+        | { error?: string | { message?: string; code?: string } }
+        | null;
+      const err = body?.error;
+      detail = typeof err === 'string' ? err : err?.message ?? err?.code ?? '';
+    } catch {
+      // Non-JSON error bodies carry no further detail.
+    }
+    throw new Error(
+      `Dashboard request failed (${response.status})${detail ? `: ${detail}` : ''}`
+    );
+  }
 
   return (await response.json()) as T;
 }
