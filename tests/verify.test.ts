@@ -2,12 +2,15 @@ import request from 'supertest';
 import app from '../src/app';
 import prisma from '../src/config/db';
 import { clearApiKeyCache } from '../src/middleware/auth';
+import { closeVerificationQueue } from '../src/queues/verificationQueue';
+import { createVerificationWorker } from '../src/workers/verificationWorker';
 import redis from '../src/config/redis';
 import { hashApiKey } from '../src/services/apiKey';
 
 describe('POST /v1/verify', () => {
   const apiKey = 'verify-test-key';
   const internalApiKey = process.env.INTERNAL_API_KEY!;
+  let verificationWorker: ReturnType<typeof createVerificationWorker>;
 
   async function waitForVerification(jobId: string) {
     for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -30,10 +33,17 @@ describe('POST /v1/verify', () => {
     });
   });
 
+  beforeAll(async () => {
+    verificationWorker = createVerificationWorker();
+    await verificationWorker.waitUntilReady();
+  });
+
   afterAll(async () => {
-  await prisma.$disconnect();
-  await redis.quit();
-});
+    await verificationWorker.close();
+    await closeVerificationQueue();
+    await prisma.$disconnect();
+    await redis.quit();
+  });
 
   it('returns valid for an unmodified chain', async () => {
     const eventResponse = await request(app).post('/v1/events').set('Authorization', `Bearer ${apiKey}`).send({
@@ -58,6 +68,43 @@ describe('POST /v1/verify', () => {
     const response = await request(app).post('/v1/verify').set('Authorization', 'Bearer nope');
 
     expect(response.status).toBe(401);
+  });
+
+  it('returns 409 when an active verification job already exists for the app', async () => {
+    await verificationWorker.pause();
+    try {
+      const firstResponse = await request(app).post('/v1/verify').set('Authorization', `Bearer ${apiKey}`);
+      expect(firstResponse.status).toBe(202);
+
+      const secondResponse = await request(app).post('/v1/verify').set('Authorization', `Bearer ${apiKey}`);
+      expect(secondResponse.status).toBe(409);
+      expect(secondResponse.body.error.code).toBe('JOB_IN_PROGRESS');
+      expect(secondResponse.body.data.jobId).toBe(firstResponse.body.data.jobId);
+    } finally {
+      await verificationWorker.resume();
+    }
+  });
+
+  it('rejects exactly one of two simultaneous POST /v1/verify requests', async () => {
+    await verificationWorker.pause();
+    try {
+      const [responseA, responseB] = await Promise.all([
+        request(app).post('/v1/verify').set('Authorization', `Bearer ${apiKey}`),
+        request(app).post('/v1/verify').set('Authorization', `Bearer ${apiKey}`)
+      ]);
+
+      const statuses = [responseA.status, responseB.status].sort();
+      expect(statuses).toEqual([202, 409]);
+
+      const accepted = responseA.status === 202 ? responseA : responseB;
+      const conflict = responseA.status === 409 ? responseA : responseB;
+
+      expect(conflict.body.error.code).toBe('JOB_IN_PROGRESS');
+      expect(conflict.body.data.jobId).toBe(accepted.body.data.jobId);
+      expect(conflict.body.data.pollUrl).toBe(`/v1/verify/${accepted.body.data.jobId}`);
+    } finally {
+      await verificationWorker.resume();
+    }
   });
 
   it('allows a trusted dashboard request for the correct owned application and job', async () => {

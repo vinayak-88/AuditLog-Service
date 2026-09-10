@@ -10,6 +10,7 @@ import healthRouter from './routes/health';
 import searchRouter from './routes/search';
 import verifyRouter from './routes/verify';
 import { apiKeyAuth, dashboardOrApiKeyAuth } from './middleware/auth';
+import { closeVerificationQueue } from './queues/verificationQueue';
 import { errorHandler } from './middleware/errorHandler';
 import { requestId } from './middleware/requestId';
 import { validateEnv } from './config/validateEnv';
@@ -101,6 +102,7 @@ if (require.main === module) {
     server.closeAllConnections();
     server.close(async () => {
       logger.info('HTTP server closed');
+      await closeVerificationQueue();
       await prisma.$disconnect();
       redis.disconnect();
       process.exit(0);
