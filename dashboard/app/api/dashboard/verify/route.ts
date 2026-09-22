@@ -53,42 +53,42 @@ export async function POST(request: Request) {
       },
     });
     if (!response.ok) {
-      if (response.status === 409) {
-        try {
-          return NextResponse.json(await response.json(), { status: 409 });
-        } catch {
-          return NextResponse.json(
-            { error: "A verification job is already running" },
-            { status: 409 },
-          );
-        }
-      }
-
+  if (response.status === 409) {
+    try {
+      return NextResponse.json(await response.json(), { status: 409 });
+    } catch {
       return NextResponse.json(
-        {
-          error:
-            response.status === 403
-              ? "Application access denied"
-              : "Unable to start verification",
-        },
-        {
-          status:
-            response.status === 400
-              ? 400
-              : response.status === 403
-                ? 403
-                : response.status === 409
-                  ? 409
-                  : response.status === 429
-                    ? 429
-                    : response.status,
-        },
+        { error: 'A verification job is already running' },
+        { status: 409 }
       );
     }
+  }
+
+  return NextResponse.json(
+    {
+      error:
+        response.status === 403
+          ? 'Application access denied'
+          : 'Unable to start verification'
+    },
+    {
+      status:
+        response.status === 400
+          ? 400
+          : response.status === 403
+            ? 403
+            : response.status === 429
+              ? 429
+              : 502
+    }
+  );
+}
 
     const result = (await response.json()) as VerifyResponse;
     return NextResponse.json(result, { status: response.status });
-  } catch {
+  } catch (error) {
+    console.error("Dashboard verification proxy error", error);
+
     return NextResponse.json(
       { error: "Unable to reach the verification service" },
       { status: 502 },
