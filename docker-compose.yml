@@ -64,6 +64,8 @@ services:
       - REDIS_PASSWORD=
       - HASH_SECRET=${HASH_SECRET:-dev-hash-secret}
       - GENESIS_HASH=${GENESIS_HASH:-audit-log-genesis}
+      - CORS_ORIGINS=*
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY:-dev-internal-api-key}
     depends_on:
       postgres:
         condition: service_healthy
