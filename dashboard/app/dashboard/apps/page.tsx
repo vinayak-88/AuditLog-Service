@@ -1,3 +1,4 @@
+import { CreateAppForm } from '../../../components/CreateAppForm';
 import { dashboardFetch } from '../../../lib/api';
 
 export const dynamic = 'force-dynamic';
@@ -41,6 +42,7 @@ export default async function AppsPage() {
       <div className="topbar">
         <h1 className="page-title">Apps</h1>
       </div>
+      <CreateAppForm />
       <div className="card table-wrap">
         <table>
           <thead>
