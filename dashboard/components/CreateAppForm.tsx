@@ -3,6 +3,7 @@
 import { Plus } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useState, type FormEvent } from 'react';
+import { OneTimeKeyPanel } from './OneTimeKeyPanel';
 
 type CreatedApp = {
   id: string;
@@ -27,7 +28,6 @@ export function CreateAppForm() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [created, setCreated] = useState<CreatedApp | null>(null);
-  const [copied, setCopied] = useState(false);
 
   function reset() {
     setOpen(false);
@@ -36,13 +36,11 @@ export function CreateAppForm() {
     setError(null);
     setLoading(false);
     setCreated(null);
-    setCopied(false);
   }
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
-    setCopied(false);
 
     const trimmedName = name.trim();
     if (!trimmedName) {
@@ -81,17 +79,6 @@ export function CreateAppForm() {
     }
   }
 
-  async function onCopy() {
-    if (!created) return;
-    try {
-      await navigator.clipboard.writeText(created.apiKey);
-      setError(null);
-      setCopied(true);
-    } catch {
-      setError('Automatic copy failed — select the key manually');
-    }
-  }
-
   function onDone() {
     reset();
     router.refresh();
@@ -99,7 +86,7 @@ export function CreateAppForm() {
 
   if (!open) {
     return (
-      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+      <div className="actions actions-end">
         <button className="button" type="button" onClick={() => setOpen(true)}>
           <Plus size={16} aria-hidden />
           Create app
@@ -110,39 +97,34 @@ export function CreateAppForm() {
 
   if (created) {
     return (
-      <div className="card grid">
-        <div>
-          <strong>{created.name}</strong> was created. Copy the API key now —
-          it will not be shown again.
-        </div>
-        <div className="field">
-          <label htmlFor="new-api-key">API key (shown once)</label>
-          <input
-            id="new-api-key"
-            className="input"
-            value={created.apiKey}
-            readOnly
-            onFocus={(event) => event.currentTarget.select()}
-          />
-        </div>
-        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-          <button className="button" type="button" onClick={onCopy}>
-            {copied ? 'Copied!' : 'Copy key'}
-          </button>
-          <button className="button secondary" type="button" onClick={onDone}>
-            Done
-          </button>
-        </div>
-        {error ? <div className="status-danger">{error}</div> : null}
-      </div>
+      <OneTimeKeyPanel
+        title="Application created"
+        subtitle={
+          <>
+            <strong>{created.name}</strong> is ready to log events.
+          </>
+        }
+        warningTitle="Copy your API key now — it will not be shown again."
+        warningBody="Store it somewhere safe. If you lose it, you can rotate the key later to generate a new one."
+        apiKey={created.apiKey}
+        onDone={onDone}
+      />
     );
   }
 
   return (
     <form className="card" onSubmit={onSubmit}>
       <div className="grid">
+        <div>
+          <h2 className="panel-title">Create application</h2>
+          <div className="panel-subtitle">
+            Register a new app to get an API key for event logging.
+          </div>
+        </div>
         <div className="field">
-          <label htmlFor="create-app-name">Name</label>
+          <label htmlFor="create-app-name">
+            Name <span className="muted">(required)</span>
+          </label>
           <input
             id="create-app-name"
             className="input"
@@ -150,11 +132,15 @@ export function CreateAppForm() {
             onChange={(event) => setName(event.target.value)}
             placeholder="My application"
             maxLength={MAX_NAME_LENGTH}
+            required
+            aria-required="true"
             disabled={loading}
           />
         </div>
         <div className="field">
-          <label htmlFor="create-app-description">Description (optional)</label>
+          <label htmlFor="create-app-description">
+            Description <span className="muted">(optional)</span>
+          </label>
           <input
             id="create-app-description"
             className="input"
@@ -165,8 +151,12 @@ export function CreateAppForm() {
             disabled={loading}
           />
         </div>
-        {error ? <div className="status-danger">{error}</div> : null}
-        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+        {error ? (
+          <div className="form-error" role="alert">
+            {error}
+          </div>
+        ) : null}
+        <div className="actions">
           <button className="button" type="submit" disabled={loading}>
             {loading ? 'Creating…' : 'Create'}
           </button>
