@@ -6,11 +6,4 @@ logs
 .next
 coverage
 *.log 
-AuditLog_Detailed.md
-questions.md
-ARCHITECTURE.md
-AuditLog_Context.md
-DATA_STORAGE.md
-issues.md
-ROUTES_AND_FLOW.md
-TYPES_AND_INTERFACES.md
+
