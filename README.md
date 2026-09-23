@@ -15,14 +15,20 @@ docker compose up -d
 npm ci
 npm run prisma:generate
 npm run prisma:migrate
-npm run api-keys:migrate
 npm run build
 npm start
 ```
 
 Run `npm run api-keys:migrate` once during rollout if the database contains
 applications created before API-key digest storage was enabled. It converts
-legacy stored keys in memory and does not print or return them.
+legacy stored keys in memory and does not print or return them. Skip it for
+fresh databases.
+
+Run the verification worker alongside the API (same image, separate process):
+
+```bash
+npm run worker
+```
 
 The API requires `DATABASE_URL`, `REDIS_HOST`, `REDIS_PORT`, `CORS_ORIGINS`,
 `HASH_SECRET`, `GENESIS_HASH`, and `INTERNAL_API_KEY`.
@@ -45,9 +51,17 @@ npm run build
 npm start
 ```
 
+The dashboard build and start validate required configuration up front
+(`API_URL` or `NEXT_PUBLIC_API_URL`, `INTERNAL_API_KEY`, `NEXTAUTH_SECRET`,
+`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`); missing values fail fast with an
+itemized error instead of failing obscurely at request time.
+
 ## Core API
 
+- `GET /v1/apps` lists the authenticated owner's active applications.
 - `POST /v1/apps` registers an app and returns an API key once.
+- `POST /v1/apps/:id/rotate-key` replaces an app's API key, returning the new key once.
+- `DELETE /v1/apps/:id` deactivates an app without deleting its audit history.
 - `POST /v1/events` ingests an audit event and appends it to the hash chain.
 - `GET /v1/events` searches events without exposing internal hash fields.
 - `GET /v1/events/activity/:resourceId` reads recent activity.
@@ -61,6 +75,7 @@ npm start
 npm run lint
 npm run typecheck
 npm run build
+npm test -- --runInBand
 cd dashboard
 npm run typecheck
 npm run build
