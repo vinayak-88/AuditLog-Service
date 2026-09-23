@@ -12,19 +12,24 @@ flowchart TD
   J --> M[Morgan to Winston - skip /health]
   M --> Health[/health router - no auth]
   Health --> Apps[/v1/apps router - requireOwnerId]
-  Apps --> Events[/v1/events + apiKeyAuth]
-  Events --> Verify[/v1/verify + dashboardOrApiKeyAuth]
+  Apps --> EventReads[/v1/events GETs + dashboardOrApiKeyAuth]
+  EventReads --> EventWrite[/v1/events POST + apiKeyAuth]
+  EventWrite --> Verify[/v1/verify + dashboardOrApiKeyAuth]
   Verify --> Export[/v1/export + dashboardOrApiKeyAuth]
   Export --> NF[global 404]
   NF --> EH[errorHandler]
 ~~~
 
 `/health` has no auth. `/v1/apps` uses route-local dashboard-owner
-authorization. `/v1/events` (both routers) requires `apiKeyAuth`.
-`/v1/verify` and `/v1/export` accept either dashboard credentials or an app API
-key via `dashboardOrApiKeyAuth`. The final 404 handler only runs when no router
-produced a response, and errorHandler only runs when an earlier handler calls
-next with an error.
+authorization. On the shared `/v1/events` prefix the read router
+(`searchRouter`: `GET /`, `GET /activity/:resourceId`) is mounted first behind
+`dashboardOrApiKeyAuth`, then the ingestion router (`eventsRouter`: `POST /`)
+behind `apiKeyAuth` — order is load-bearing, because Express executes each
+mount's auth middleware for every subpath. `/v1/verify` and `/v1/export`
+accept either dashboard credentials or an app API key via the same dual
+credential. The final 404 handler only runs when no router produced a
+response, and errorHandler only runs when an earlier handler calls next with
+an error.
 
 ## Built-in/global middleware
 
@@ -81,24 +86,24 @@ The exact default header set is a third-party library behavior and is not config
 ### apiKeyAuth
 
 - **File/function:** src/middleware/auth.ts, apiKeyAuth(req, res, next).
-- **Where:** per-route guard on `/v1/events` (both routers); fallback inside `dashboardOrApiKeyAuth` for verify/export.
+- **Where:** per-route guard on the ingestion router (`eventsRouter`: `POST /`); fallback inside `dashboardOrApiKeyAuth` for event reads, verify, and export.
 - **What:** authenticates an active App by customer bearer API key and makes it available to protected routes.
 - **Checks:** `Authorization: Bearer <raw als_ key>` → `hashApiKey` (HMAC-SHA256 with `HASH_SECRET`) → Redis `apikey:{digest}` → PostgreSQL `App.findFirst({ apiKey: digest, isActive: true })` on miss/failure.
 - **Adds:** assigns non-secret app data (`Omit<App,'apiKey'>`) to `req.auditApp` on success; writes the cache entry with `API_KEY_CACHE_TTL_SECONDS` (default 600 s).
 - **Failures:** 401 `MISSING_API_KEY` if the header does not begin with `Bearer `; 401 `INVALID_API_KEY` when no active matching App exists. Corrupt/inactive cached values are evicted and retried via PostgreSQL. Redis read/write errors log warnings and fall back/continue. Database lookup failures are forwarded via `next(err)`.
-- **Downstream:** every `/v1/events` handler and (via fallback) verify/export handlers rely on `req.auditApp`.
+- **Downstream:** the ingestion handler and (via fallback) event-read, verify, and export handlers rely on `req.auditApp`.
 
 Cache values never contain the raw API key; see [DATA_STORAGE.md](DATA_STORAGE.md#api-key-cache).
 
 ### dashboardOrApiKeyAuth
 
 - **File/function:** src/middleware/auth.ts, dashboardOrApiKeyAuth(req, res, next).
-- **Where:** guard on `/v1/verify` and `/v1/export` (mounted in app.ts).
+- **Where:** guard on the event read router (`searchRouter`), `/v1/verify`, and `/v1/export` (mounted in app.ts; the read router is mounted before the ingestion router on purpose).
 - **What:** accepts either server-to-server dashboard credentials or a customer app key for the same route.
 - **Dashboard path checks:** `Authorization: Bearer INTERNAL_API_KEY` (exact match) **plus** `x-owner-id` **and** `x-app-id` headers → `prisma.app.findFirst({ id: appId, ownerId, isActive: true })`.
 - **Adds:** sets `req.auditApp` to the owned app on the dashboard path; otherwise delegates to `apiKeyAuth` (which sets it from the customer key).
 - **Failures:** 403 `DASHBOARD_AUTH_REQUIRED` when the internal key is presented without both headers; 403 `APP_ACCESS_DENIED` when the app is missing, inactive, or owned by someone else; otherwise the `apiKeyAuth` 401 contract. Prisma failures are forwarded via `next(err)`.
-- **Downstream:** verify/export handlers work identically afterwards (`req.auditApp!`); polling authorization (`job.appId !== app.id` → 404) enforces the same app scope regardless of which credential was used.
+- **Downstream:** event-read, verify, and export handlers work identically afterwards (`req.auditApp!`); polling authorization (`job.appId !== app.id` → 404) enforces the same app scope regardless of which credential was used.
 - **Security note:** unlike the apps-router helper, this path requires `x-app-id` (not `x-user-id`) and verifies ownership against the database per request.
 
 ### getDashboardOwnerId / requireOwnerId

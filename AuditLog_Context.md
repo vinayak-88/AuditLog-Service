@@ -4,7 +4,7 @@
 > Feed this entire file as context to any AI assistant before asking for help with any part of the codebase.
 > Every architectural decision, schema definition, API contract, and implementation detail is documented here.
 >
-> Last updated: after BullMQ durable verification worker, dual dashboard/API-key auth on verify/export, Docker api+worker services, and CI hardening.
+> Last updated: after dashboard owner-scoped event reads, app create/rotate/deactivate management UI, hardened /health statuses, numeric/secret startup validation, dashboard CI job, and non-breaking dependency fixes.
 
 ---
 
@@ -98,22 +98,32 @@ audit-log-service/
 │   │   ├── api/dashboard/verify/route.ts          # Server proxy: start verification
 │   │   ├── api/dashboard/verify/[jobId]/route.ts  # Server proxy: poll verification
 │   │   ├── api/dashboard/export/route.ts          # Server proxy: stream export
+│   │   ├── api/dashboard/apps/route.ts            # Server proxy: create app (raw key once)
+│   │   ├── api/dashboard/apps/[id]/route.ts       # Server proxy: deactivate app (204)
+│   │   ├── api/dashboard/apps/[id]/rotate-key/route.ts  # Server proxy: rotate key (new key once)
 │   │   └── dashboard/
-│   │       ├── page.tsx          # Main dashboard — event volume, recent activity
-│   │       ├── events/page.tsx   # Event search and filter UI
+│   │       ├── page.tsx          # Overview — selected-app event volume, recent activity
+│   │       ├── events/page.tsx   # Event search and filter UI for the selected app
 │   │       ├── verify/page.tsx   # Verification trigger, job polling, result display
 │   │       ├── export/page.tsx   # Export UI with filter options
-│   │       └── apps/page.tsx     # Active-app listing
+│   │       └── apps/page.tsx     # Active-app listing + create/rotate/deactivate management
 │   ├── lib/
-│   │   ├── api.ts                # Server-only dashboard fetch helpers (INTERNAL_API_KEY, owner/app headers)
+│   │   ├── api.ts                # Server-only dashboard fetch helpers (INTERNAL_API_KEY, owner/app headers); throws on non-2xx
 │   │   ├── api-url.ts            # Configured API URL builder with /v1 normalization
+│   │   ├── app-selection.ts      # OwnerAppSummary + resolveSelectedAppId (explicit per-app context)
 │   │   └── auth.ts               # Shared NextAuth GitHub provider configuration
 │   ├── scripts/
-│   │   └── load-env.cjs          # Loads repository-root .env for dashboard start
+│   │   ├── load-env.cjs          # Loads repository-root .env for dashboard start
+│   │   └── validate-env.cjs      # Fail-fast dashboard config validation (called by next.config.mjs)
+│   ├── next.config.mjs           # Loads root .env, then validates dashboard config at build/start
 │   └── components/
 │       ├── AuthControls.tsx      # GitHub sign-in and NextAuth sign-out controls
 │       ├── EventTable.tsx
-│       ├── SearchFilters.tsx
+│       ├── SearchFilters.tsx     # Filter form; preserves the selected appId across searches
+│       ├── AppSelector.tsx       # Per-app context switcher for multi-app owners
+│       ├── CreateAppForm.tsx     # Create-app form + one-time key success view
+│       ├── AppActions.tsx        # Per-row rotate/deactivate confirms + one-time key view
+│       ├── OneTimeKeyPanel.tsx   # Shared one-time raw-key display (state-only, never persisted)
 │       ├── ActivityFeed.tsx
 │       ├── VerificationResult.tsx
 │       └── StatsCards.tsx
@@ -128,6 +138,7 @@ audit-log-service/
 │   ├── events.test.ts
 │   ├── verify.test.ts
 │   ├── verificationWorker.test.ts
+│   ├── dashboardEvents.test.ts   # Owner-scoped event reads (own/cross-owner/random-ID/customer-key)
 │   ├── search.test.ts
 │   └── activityCache.test.ts
 ├── mock/
@@ -171,8 +182,9 @@ production image as the API.
 
 ### src/config/db.ts — Prisma Singleton
 
-Standard globalThis-cached PrismaClient singleton (cached outside production).
-No explicit pool settings; `DATABASE_URL` selects the database.
+Plain `new PrismaClient({ log: ['error'] })` singleton. There is no globalThis
+cache, no pool tuning, and no per-environment log switching. `DATABASE_URL`
+selects the database.
 
 ### src/config/redis.ts — ioredis Singleton (API process)
 
@@ -190,7 +202,13 @@ stacks. There are no file transports in the current implementation.
 
 Requires `DATABASE_URL`, `REDIS_HOST`, `REDIS_PORT`, `CORS_ORIGINS`,
 `HASH_SECRET`, `GENESIS_HASH`, `INTERNAL_API_KEY` when the server starts
-directly. Exits 1 when any is missing.
+directly, and additionally rejects malformed numerics for all 23 consumed
+numeric settings (ports 1–65535, counts/TTLs positive integers; unset still
+means "use default"), a non-PostgreSQL `DATABASE_URL` scheme, and an empty
+`CORS_ORIGINS` list. `HASH_SECRET`/`INTERNAL_API_KEY` under 32 characters
+are fatal under `NODE_ENV=production` and warnings elsewhere (so compose
+defaults and CI keep working). Called by both the API and the worker
+entrypoints; exits 1 with itemized `[FATAL]` lines on any problem.
 
 ---
 
@@ -201,7 +219,11 @@ Mounting order:
 1. `helmet()`, `cors()` (allows `Content-Type, Authorization, x-owner-id, x-user-id, x-app-id, x-request-id`; exposes `x-request-id`), `requestId`, `express.json({ limit: '1mb' })`, Morgan (skip `/health`, includes `x-request-id`).
 2. `/health` — no auth.
 3. `/v1/apps` — dashboard-owner authorization (route-local, `INTERNAL_API_KEY` + owner headers). Not behind `apiKeyAuth`.
-4. `/v1/events` (events + search routers) — `apiKeyAuth` (customer app key only).
+4. `/v1/events` — read router (`searchRouter`: `GET /`, `GET /activity/:resourceId`)
+   behind `dashboardOrApiKeyAuth` mounted FIRST, then ingestion (`eventsRouter`:
+   `POST /`) behind `apiKeyAuth`. Order is load-bearing: a customer-only gate
+   mounted first would reject dashboard reads before they reach the search
+   router. `POST /` still falls through to `apiKeyAuth`.
 5. `/v1/verify` — `dashboardOrApiKeyAuth` (customer key **or** internal + `x-owner-id` + `x-app-id`).
 6. `/v1/export` — `dashboardOrApiKeyAuth` (same dual credential).
 7. Global JSON 404 handler, then `errorHandler`.
@@ -296,15 +318,16 @@ throws `ZodError`, mapped by `errorHandler` to the same 400 contract.
 
 ### Authentication
 
-**apiKeyAuth** (`/v1/events`, fallback for verify/export): `Authorization:
+**apiKeyAuth** (ingestion `POST /v1/events`; fallback for event reads, verify, export): `Authorization:
 Bearer <raw als_ key>` → HMAC digest (`HASH_SECRET`) → Redis
 `apikey:{digest}` (non-secret data, 600 s TTL) → PostgreSQL active-App lookup on
 miss/failure → `req.auditApp`. 401 `MISSING_API_KEY`/`INVALID_API_KEY`.
 
-**dashboardOrApiKeyAuth** (`/v1/verify`, `/v1/export`): valid
-`INTERNAL_API_KEY` + `x-owner-id` + `x-app-id` → owned active-app lookup (403
-`DASHBOARD_AUTH_REQUIRED`/`APP_ACCESS_DENIED`) → `req.auditApp`; otherwise
-delegates to `apiKeyAuth`. `INTERNAL_API_KEY` is server-only; browsers never
+**dashboardOrApiKeyAuth** (`GET /v1/events` reads, `/v1/verify`, `/v1/export`):
+valid `INTERNAL_API_KEY` + `x-owner-id` + `x-app-id` → owned active-app lookup
+(403 `DASHBOARD_AUTH_REQUIRED`/`APP_ACCESS_DENIED`) → `req.auditApp`;
+otherwise delegates to `apiKeyAuth`. `POST /v1/events` stays on `apiKeyAuth`
+(customer keys only). `INTERNAL_API_KEY` is server-only; browsers never
 receive it.
 
 **getDashboardOwnerId/requireOwnerId** (`/v1/apps`): valid internal key +
@@ -414,12 +437,25 @@ to `/login` (`signIn('github')`, `signOut` in the sidebar).
 
 Backend access is server-side only: `dashboard/lib/api.ts` (`server-only`) uses
 `API_URL` + `INTERNAL_API_KEY` + `x-owner-id` (GitHub id) + `x-app-id`, with
-`cache: 'no-store'`. The public `NEXT_PUBLIC_API_URL` is only for browser-safe
-URL building. Dashboard verify/poll/export proxy routes
-(`app/api/dashboard/...`) require a session (401 otherwise), validate UUID
-`appId`/`jobId` (400 otherwise), forward with the internal credential, map
-403/404/429 faithfully, and (for polls) reject `appId` mismatches with 404. The
-browser never sees `INTERNAL_API_KEY` or raw app keys.
+`cache: 'no-store'`. `dashboardFetch` throws on non-2xx (with status plus the
+backend message) instead of returning null, so failures surface as error
+cards rather than silent empty data. The public `NEXT_PUBLIC_API_URL` is only
+for browser-safe URL building. Dashboard proxy routes
+(`app/api/dashboard/...`: verify start/poll, export stream, app
+create/rotate-key/deactivate) require a session (401 otherwise), validate
+UUID `appId` (400 otherwise), forward with the internal credential, map
+400/401/403/404/429 faithfully (deactivate preserves the backend 204 with no
+JSON parsing), and (for polls) reject `appId` mismatches with 404. The
+browser never sees `INTERNAL_API_KEY`; raw app keys appear only in
+transient one-time success panels (`OneTimeKeyPanel`, state-only, wiped on
+Done) and never in lists, URLs, storage, or logs.
+
+Overview/Events pages resolve an explicit selected app from the owner's own
+app list (`dashboard/lib/app-selection.ts` `resolveSelectedAppId`,
+`AppSelector.tsx` switcher for multi-app owners, `SearchFilters` preserves
+`appId`); there is no unscoped owner-wide event read. The Apps page adds
+create (`CreateAppForm`), per-row rotate/deactivate confirms
+(`AppActions.tsx`), and empty/error states.
 
 `dashboard/lib/api-url.ts` normalizes to `/v1` and requires a configured base.
 
@@ -442,17 +478,21 @@ idempotent duplicates. 400/401/429/500.
 
 ### GET /v1/events
 
-**Authentication:** app key only. Filters: exact `actorId/actorType/action/
+**Authentication:** app key **or** dashboard internal + owner/app headers
+(same dual credential as verify/export; `searchRouter` is mounted first so
+dashboard reads reach it). Filters: exact `actorId/actorType/action/
 resourceId/resourceType`, `startDate/endDate` (90-day two-sided rule), `page`
 (default 1, max 1000), `limit` (default 50, max 100). Newest-first OFFSET
 paging via one Prisma transaction (`findMany` + `count`). Omits
 `entryHash/previousHash/idempotencyKey`. 200 `{ events, pagination }`.
+Dashboard calls always carry an explicit `x-app-id` from the owner's own
+list; there is no unscoped owner-wide read.
 
 ### GET /v1/events/activity/:resourceId
 
-**Authentication:** app key only. Query `limit` (default 20, max 50).
-Redis-first (`source: cache`), PostgreSQL fallback + async warm (`source:
-database`).
+**Authentication:** same dual credential as search. Query `limit` (default
+20, max 50). Redis-first (`source: cache`), PostgreSQL fallback + async warm
+(`source: database`).
 
 ### POST /v1/verify — Enqueue verification job
 
@@ -500,8 +540,18 @@ Internal auth + limiter; UUID id scoped to owner. Soft-deletes
 
 ### GET /health (unversioned)
 
-No auth. 200 `ok` / 503 `degraded` with per-dependency (`postgresql`, `redis`)
-status and ISO timestamp (3 s per-check timeout).
+No auth. 200 `ok` / 503 `degraded` with generic per-dependency
+(`postgresql`, `redis`) `connected`/`unavailable` statuses and ISO timestamp
+(3 s per-check timeout). Raw dependency error messages stay in server-side
+logs and never appear in the public response.
+
+Dashboard proxies for the same operations: `POST
+/api/dashboard/apps/[id]/rotate-key` (session + UUID; forwards backend 200
+JSON with `newApiKey`; 400/401/403/404/429 mapped, else generic 502) and
+`DELETE /api/dashboard/apps/[id]` (session + UUID; preserves backend 204
+with no JSON parsing; same error mapping). App creation proxy `POST
+/api/dashboard/apps` validates `name` (1–100) / `description` (≤500) and
+returns the backend 201 JSON.
 
 ---
 
@@ -573,11 +623,16 @@ NEXT_PUBLIC_API_URL="https://your-railway-api-url.railway.app"
 API_URL="https://your-railway-api-url.railway.app"
 ```
 
-The API validates `DATABASE_URL`, `REDIS_HOST`, `REDIS_PORT`, `CORS_ORIGINS`,
-`HASH_SECRET`, `GENESIS_HASH`, and `INTERNAL_API_KEY` when started directly.
-`DASHBOARD_OWNER_ID`, `ALLOW_DASHBOARD_DEV_AUTH`, and
-`ENABLE_API_KEY_CACHE_IN_TESTS` are not used and must not be documented as
-behavior. CI uses deterministic `HASH_SECRET`/`INTERNAL_API_KEY` values.
+The API and worker entrypoints run `validateEnv()` on startup: the 7 required
+variables above, plus numeric validation for all consumed settings, plus a
+32-character floor for `HASH_SECRET`/`INTERNAL_API_KEY` under
+`NODE_ENV=production` (warning only elsewhere). `DASHBOARD_OWNER_ID`,
+`ALLOW_DASHBOARD_DEV_AUTH`, and `ENABLE_API_KEY_CACHE_IN_TESTS` are not used
+and must not be documented as behavior. CI uses deterministic
+`HASH_SECRET`/`INTERNAL_API_KEY` values. Dashboard boot validates its own
+config (`dashboard/scripts/validate-env.cjs` via `next.config.mjs`):
+`INTERNAL_API_KEY`, `NEXTAUTH_SECRET` (≥32), `GITHUB_*`, and at least one of
+`API_URL`/`NEXT_PUBLIC_API_URL` with valid http(s) shape.
 
 ---
 
@@ -604,9 +659,11 @@ Jest + Supertest against real PostgreSQL and Redis:
 * `activityCache.test.ts`: activity cache and database fallback.
 * `verify.test.ts`: BullMQ enqueue, polling, 409/dedup under concurrency, dashboard owner/app scoping, tamper detection (uses a live worker; pauses it for contention tests).
 * `verificationWorker.test.ts`: retry-then-complete, terminal failure, heartbeat renewal, sentinel ownership.
+* `dashboardEvents.test.ts`: dashboard owner-scoped event reads (own app 200, cross-owner/random-ID 403, missing app context 403, customer-key reads, filtered search, activity isolation).
 
-Run with `npm test` (`--runInBand` in CI). Dashboard validation uses its
-separate `typecheck`/`build`; there is no dashboard Jest suite.
+Run with `npm test` (`--runInBand` in CI); currently 38/38 across 8 suites.
+Dashboard validation uses its separate `typecheck`/`build`; there is no
+dashboard Jest suite.
 
 ---
 
@@ -641,14 +698,14 @@ non-root `node` user, `/health` HEALTHCHECK, default `node dist/app.js`).
 
 ## GitHub Actions CI
 
-Workflow `CI`, triggers `push`/`pull_request` on `main`/`master`, one job
-(`Test & Build` on `ubuntu-latest`) with `postgres:15` and `redis:7-alpine`
-services. Deterministic CI-only secrets (`HASH_SECRET`,
-`INTERNAL_API_KEY`, raised verify/events limits). Steps: checkout → Node 20
-(`cache: npm`) → `npm ci` → `prisma generate` → `typecheck` → `lint` →
-`prisma migrate deploy` → `jest --runInBand` → production `build` → `git diff
---check`. There is no dashboard job and no deploy step — CI validates; it does
-not ship.
+Workflow `CI`, triggers `push`/`pull_request` on `main`/`master`, with two
+jobs: `Test & Build` (backend: `ubuntu-latest` with `postgres:15` and
+`redis:7-alpine` services; deterministic CI-only secrets; steps checkout →
+Node 20 → `npm ci` → `prisma generate` → `typecheck` → `lint` →
+`prisma migrate deploy` → `jest --runInBand` → production `build` →
+`git diff --check`) and `Dashboard typecheck & build` (lockfile-pinned
+`npm ci`, `typecheck`, `build` with non-secret deployment-shaped config).
+There is no deploy step — CI validates; it does not ship.
 
 ---
 

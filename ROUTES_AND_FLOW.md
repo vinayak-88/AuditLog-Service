@@ -6,7 +6,7 @@ Express is initialized by createApp() in src/app.ts. The application mounts rout
 
 1. GET /health through healthRouter, with no authentication.
 2. /v1/apps through appsRouter, with route-local dashboard-owner authorization (no `apiKeyAuth`).
-3. /v1/events through eventsRouter (`POST /`) and searchRouter (`GET /`, `GET /activity/:resourceId`), each behind `apiKeyAuth` (customer app key only).
+3. /v1/events through searchRouter (`GET /`, `GET /activity/:resourceId`) behind `dashboardOrApiKeyAuth` mounted first, then eventsRouter (`POST /`) behind `apiKeyAuth`. Order is load-bearing: a customer-only gate mounted first would reject dashboard reads before they reach the search router. Ingestion stays customer-key-only.
 4. /v1/verify through verifyRouter behind `dashboardOrApiKeyAuth` (customer key **or** `INTERNAL_API_KEY` + `x-owner-id` + `x-app-id`).
 5. /v1/export through exportRouter behind `dashboardOrApiKeyAuth` (same dual credential).
 6. A global JSON 404 handler and then errorHandler.
@@ -27,8 +27,8 @@ Global security and parsing middleware runs before these routes. Its exact order
 | POST | /v1/apps/:id/rotate-key | apps.ts | Same dashboard authorization + URL id must belong to that owner |
 | DELETE | /v1/apps/:id | apps.ts | Same dashboard authorization + URL id must belong to that owner |
 | POST | /v1/events | events.ts | Active application API key (`apiKeyAuth`) |
-| GET | /v1/events | search.ts | Active application API key (`apiKeyAuth`) |
-| GET | /v1/events/activity/:resourceId | search.ts | Active application API key (`apiKeyAuth`) |
+| GET | /v1/events | search.ts | Active app key **or** dashboard `INTERNAL_API_KEY` + `x-owner-id` + `x-app-id` |
+| GET | /v1/events/activity/:resourceId | search.ts | Same dual credential as search |
 | POST | /v1/verify | verify.ts | Active app key **or** dashboard `INTERNAL_API_KEY` + `x-owner-id` + `x-app-id` |
 | GET | /v1/verify/:jobId | verify.ts | Same dual credential as POST; job additionally scoped to the authenticated app |
 | GET | /v1/export | export.ts | Same dual credential as verify |
@@ -52,7 +52,7 @@ Global security and parsing middleware runs before these routes. Its exact order
 **Responses:**
 
 - 200: status is ok; both dependency values remain connected.
-- 503: status is degraded; a failed dependency contains an error message derived from the caught error.
+- 503: status is degraded; a failed dependency reads `unavailable` (raw messages stay in server-side logs).
 
 Both responses include an ISO timestamp and a dependencies object with postgresql and redis keys. The timeout timer is not explicitly cleared after a successful operation.
 
@@ -135,6 +135,31 @@ Unknown body properties are removed by normal Zod object parsing rather than rej
 
 **Errors:** same path, authorization, rate, and not-found behavior as key rotation.
 
+## Dashboard proxy relationships
+
+The dashboard never calls backend routes from the browser with credentials.
+Session-guarded proxy routes (`dashboard/app/api/dashboard/...`, all requiring
+`getServerSession`, 401 otherwise) attach `INTERNAL_API_KEY` plus the
+session-derived owner server-side:
+
+- `POST /api/dashboard/apps` validates `name` (1–100) / `description` (≤500),
+  forwards to `POST /v1/apps`, and returns the backend 201 JSON (raw key
+  once). 400/401/429 map faithfully, else generic 502.
+- `POST /api/dashboard/apps/[id]/rotate-key` validates the UUID, forwards to
+  `POST /v1/apps/:id/rotate-key`, and returns the backend 200 JSON
+  (`newApiKey` once). 400/401/403/404/429 map faithfully, else generic 502.
+- `DELETE /api/dashboard/apps/[id]` validates the UUID, forwards to
+  `DELETE /v1/apps/:id`, and preserves the 204 with no JSON parsing.
+  Same error mapping.
+- Verify start/poll and export proxies behave the same way (polls
+  additionally reject `appId` mismatches with 404).
+
+No proxy accepts an owner id from the browser, and none returns
+`INTERNAL_API_KEY`. Overview/Events resolve an explicit selected app from the
+owner's own `GET /v1/apps` list (first owned app when the requested id is
+absent or foreign) and send it as `x-app-id`; search filters preserve it.
+Raw keys appear only in transient one-time panels, wiped on Done.
+
 ## Audit-event ingestion
 
 ### POST /v1/events
@@ -205,7 +230,7 @@ For the hash and transaction mechanics, see [ARCHITECTURE.md](ARCHITECTURE.md#au
 
 **Why it exists:** returns a page of authenticated-app audit events without internal chain fields.
 
-**Flow:** apiKeyAuth -> searchRateLimiter -> validateQuery(SearchEventsSchema) -> asyncHandler -> buildEventWhere -> Prisma transaction containing findMany and count -> JSON response.
+**Flow:** dashboardOrApiKeyAuth -> searchRateLimiter -> validateQuery(SearchEventsSchema) -> asyncHandler -> buildEventWhere -> Prisma transaction containing findMany and count -> JSON response.
 
 **Supported query parameters:**
 
@@ -222,13 +247,13 @@ When both dates are present, end must not precede start and their range must be 
 
 **Response:** 200 with data.events and data.pagination containing page, limit, total, and totalPages.
 
-**Errors:** rate limit 429; invalid query 400 VALIDATION_ERROR; authentication 401 (customer key only — dashboard internal credentials are not accepted here); database failures forwarded to the generic handler.
+**Errors:** rate limit 429; invalid query 400 VALIDATION_ERROR; customer-key failures 401 (`MISSING_API_KEY`/`INVALID_API_KEY`); dashboard-credential failures 403 (`DASHBOARD_AUTH_REQUIRED`/`APP_ACCESS_DENIED`); database failures forwarded to the generic handler. Dashboard calls always carry an explicit `x-app-id` from the owner's own app list.
 
 ### GET /v1/events/activity/:resourceId
 
 **Why it exists:** reads a recent resource activity feed, preferring Redis over PostgreSQL.
 
-**Flow:** apiKeyAuth -> searchRateLimiter -> validateQuery(ActivityQuerySchema) -> asyncHandler -> local resourceId Zod parse -> getActivityFeed -> JSON response.
+**Flow:** dashboardOrApiKeyAuth -> searchRateLimiter -> validateQuery(ActivityQuerySchema) -> asyncHandler -> local resourceId Zod parse -> getActivityFeed -> JSON response.
 
 **Path/query input:**
 

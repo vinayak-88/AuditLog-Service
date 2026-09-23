@@ -52,7 +52,7 @@ flowchart LR
   Dashboard --> Express
   Express --> Global[Helmet / CORS / request ID / JSON parser / Morgan]
   Global --> Apps[/v1/apps router]
-  Global --> EventRoutes[/v1/events routers<br/>apiKeyAuth only]
+  Global --> EventRoutes[/v1/events routers<br/>POST: apiKeyAuth only<br/>GET: dashboardOrApiKeyAuth]
   Global --> VerifyRoutes[/v1/verify router<br/>dashboardOrApiKeyAuth]
   Global --> ExportRoute[/v1/export router<br/>dashboardOrApiKeyAuth]
   Apps --> Prisma[Prisma client]
@@ -76,8 +76,13 @@ flowchart LR
 
 1. `/health` first (no authentication).
 2. `/v1/apps` (dashboard-owner authorization via `INTERNAL_API_KEY`, route-local).
-3. `/v1/events` behind `apiKeyAuth` (two routers share the prefix: `eventsRouter`
-   for `POST /`, `searchRouter` for `GET /` and `GET /activity/:resourceId`).
+3. `/v1/events` behind two routers sharing the prefix, with the read router
+   mounted first on purpose: `searchRouter` (`GET /`, `GET /activity/:resourceId`)
+   behind `dashboardOrApiKeyAuth`, then `eventsRouter` (`POST /`) behind
+   `apiKeyAuth`. Express executes each mount's auth middleware for every
+   subpath, so a customer-only gate mounted first would reject dashboard reads
+   before they reach the search router. `POST /` still falls through to
+   `apiKeyAuth`, so customer write authentication is unchanged.
 4. `/v1/verify` behind `dashboardOrApiKeyAuth`.
 5. `/v1/export` behind `dashboardOrApiKeyAuth`.
 6. Global JSON 404 handler, then `errorHandler`.
@@ -120,14 +125,14 @@ sequenceDiagram
     G->>R: no auth
   else /v1/apps
     G->>R: route-local requireOwnerId
-  else /v1/events
+  else POST /v1/events
     G->>A: apiKeyAuth (Bearer app key)
     A->>D: API-key cache lookup
     alt cache miss or Redis failure
       A->>P: App lookup by digest
     end
     A->>R: req.auditApp set
-  else /v1/verify or /v1/export
+  else GET /v1/events, /v1/verify or /v1/export
     G->>A: dashboardOrApiKeyAuth
     alt INTERNAL_API_KEY + owner/app headers
       A->>P: owned-app lookup
@@ -282,18 +287,33 @@ Dashboard/server-to-server access has two shapes:
   token paired with `x-owner-id` or `x-user-id` yields the owner scope.
   `requireOwnerId()` throws 401 `DASHBOARD_AUTH_REQUIRED` when no owner can be
   derived. No app API key is accepted here.
-- `/v1/verify` and `/v1/export` use `dashboardOrApiKeyAuth`: if the request
-  presents the valid `INTERNAL_API_KEY`, it must also supply `x-owner-id` **and**
-  `x-app-id`; the handler looks up that active owned app (403
-  `DASHBOARD_AUTH_REQUIRED` when headers are missing, 403 `APP_ACCESS_DENIED`
-  when the app is not owned by that owner) and sets `req.auditApp`. Otherwise
-  the request falls through to `apiKeyAuth`. `INTERNAL_API_KEY` is server-only
+- `/v1/verify`, `/v1/export`, and the read-only `GET /v1/events` routes
+  (`searchRouter`: search and activity) use `dashboardOrApiKeyAuth`: if the
+  request presents the valid `INTERNAL_API_KEY`, it must also supply
+  `x-owner-id` **and** `x-app-id`; the handler looks up that active owned app
+  (403 `DASHBOARD_AUTH_REQUIRED` when headers are missing, 403
+  `APP_ACCESS_DENIED` when the app is not owned by that owner) and sets
+  `req.auditApp`. Otherwise the request falls through to `apiKeyAuth`.
+  `POST /v1/events` (ingestion) stays on `apiKeyAuth`, so customer write
+  authentication is unchanged. `INTERNAL_API_KEY` is server-only
   (dashboard `lib/api.ts` is `server-only`); browser clients never receive it.
 
 Dashboard pages and dashboard API proxy routes are additionally guarded by
 NextAuth/GitHub sessions (`getServerSession`); unauthenticated callers are
 redirected to `/login` or receive 401. The GitHub user id (`token.sub`,
 exposed as `session.user.id`) is the `ownerId` sent in `x-owner-id`.
+
+Dashboard app management (create, rotate, deactivate) goes through
+session-guarded proxy routes (`dashboard/app/api/dashboard/apps/...`) that
+validate UUIDs, derive ownership exclusively from the session via
+`dashboardRequest`, and map backend errors to safe messages. The Overview and
+Events pages resolve an explicit selected app from the owner's own app list
+(`dashboard/lib/app-selection.ts`, `AppSelector.tsx`) and send it as
+`x-app-id`; one owner can own many apps, so there is no unscoped
+owner-wide event read. `dashboardFetch` throws on non-2xx instead of
+returning null, so API failures surface as error cards rather than silent
+empty data. Raw keys are shown once (`OneTimeKeyPanel`) and live only in
+transient component state.
 
 ### Activity cache hit and miss
 
@@ -327,8 +347,8 @@ it.
 |---|---|
 | Schema/body/query validation | Validation middleware returns 400 `VALIDATION_ERROR`; route-local Zod errors reach `errorHandler`, which returns the same contract. |
 | Missing/invalid per-app key | `apiKeyAuth` returns 401 `MISSING_API_KEY` or `INVALID_API_KEY`. |
-| Missing dashboard owner headers on verify/export | `dashboardOrApiKeyAuth` returns 403 `DASHBOARD_AUTH_REQUIRED`. |
-| Dashboard-owned app mismatch on verify/export | Returns 403 `APP_ACCESS_DENIED`. |
+| Missing dashboard owner headers on verify/export/events reads | `dashboardOrApiKeyAuth` returns 403 `DASHBOARD_AUTH_REQUIRED`. |
+| Dashboard-owned app mismatch on verify/export/events reads | Returns 403 `APP_ACCESS_DENIED`. |
 | Missing dashboard authorization on apps routes | `requireOwnerId()` throws `AppError`; the final handler returns 401 `DASHBOARD_AUTH_REQUIRED`. |
 | Duplicate verification per app | `POST /v1/verify` returns 409 `JOB_IN_PROGRESS` with existing `jobId`/`pollUrl`; concurrent acquires are serialized by the Lua sentinel. |
 | Verification enqueue failure | Persists `failed` job, releases the sentinel, and rethrows (generic 500). |
@@ -338,6 +358,7 @@ it.
 | Redis cache failure | API-key cache, activity cache, and analytics cache generally log and fall back or continue. Verification polling cannot recover a job that Redis did not store. |
 | PostgreSQL failure in wrapped routes | `asyncHandler` forwards the rejection to `errorHandler`, normally yielding generic 500 unless it is an `AppError`. |
 | Verification exception in worker | Worker persists `pending`/`retrying` (retries remain) or `failed` (exhausted), releases the sentinel only on terminal failure, and rethrows so BullMQ retries. The initiating HTTP response was already sent. |
+| Dependency failure on `/health` | 503 `degraded` with generic `unavailable` per dependency; raw messages stay in server-side logs. |
 | Unknown route | Global handler returns 404 `NOT_FOUND`. |
 | Unexpected forwarded exception | `errorHandler` logs request/path/stack and sends generic 500. |
 
@@ -371,6 +392,13 @@ Verification concurrency is coordinated by the atomic Redis sentinel:
 
 Values are supplied by the process environment. Most constants are read at
 module initialization, so changing the environment requires a process restart.
+`validateEnv()` (`src/config/validateEnv.ts`, called by both the API and the
+worker entrypoints) rejects missing required variables, malformed numerics
+for every consumed numeric setting (ports 1–65535, counts/TTLs positive
+integers; unset still means "use default"), malformed `DATABASE_URL`/
+`CORS_ORIGINS`, and weak `HASH_SECRET`/`INTERNAL_API_KEY` under
+`NODE_ENV=production` (warning only elsewhere, so compose defaults and CI
+keep working).
 
 | Variable | Required / default | Used by | Runtime effect |
 |---|---|---|---|
@@ -431,8 +459,11 @@ healthy. The production image is non-root (`USER node`), installs OpenSSL for
 Prisma, and has a `/health` healthcheck.
 
 Planned but not implemented as automation: Railway hosting for API/PostgreSQL/
-Redis, Vercel hosting for the dashboard, and any deploy step in CI. CI builds
-and tests only. There is no AWS/Terraform/CD pipeline in the current codebase.
+Redis, Vercel hosting for the dashboard, and any deploy step in CI. CI runs a
+backend job (generate, typecheck, lint, migrate, tests, build, diff-check) plus
+an independent dashboard job (`npm ci`, typecheck, build with non-secret
+deployment-shaped config). There is no AWS/Terraform/CD pipeline in the
+current codebase.
 
 For exact endpoint contracts see [ROUTES_AND_FLOW.md](ROUTES_AND_FLOW.md); for
 storage layouts see [DATA_STORAGE.md](DATA_STORAGE.md); and for type-level
