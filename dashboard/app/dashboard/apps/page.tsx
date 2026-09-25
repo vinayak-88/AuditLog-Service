@@ -91,7 +91,16 @@ export default async function AppsPage() {
                   <td className="count">{app._count.auditLogs.toLocaleString()}</td>
                   <td>{new Date(app.createdAt).toLocaleString()}</td>
                   <td>
-                    <AppActions id={app.id} name={app.name} />
+                    <AppActions
+                      app={{
+                        id: app.id,
+                        name: app.name,
+                        description: app.description,
+                        isActive: app.isActive,
+                        createdAt: app.createdAt,
+                        auditLogCount: app._count.auditLogs
+                      }}
+                    />
                   </td>
                 </tr>
               ))}

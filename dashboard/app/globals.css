@@ -126,6 +126,47 @@ select {
   padding: 16px;
 }
 
+.modal-overlay {
+  align-items: flex-start;
+  background: rgba(23, 32, 42, 0.45);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  overflow-y: auto;
+  padding: 48px 16px 16px;
+  position: fixed;
+  z-index: 50;
+}
+
+.modal-card {
+  max-width: 560px;
+  width: 100%;
+}
+
+.modal-header {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.detail-list {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+}
+
+.detail-list dt {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.detail-list dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
 .stat-value {
   font-size: 30px;
   font-weight: 700;

@@ -2,11 +2,11 @@
 
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
+import { AppDetailsModal, type AppDetails } from './AppDetailsModal';
 import { OneTimeKeyPanel } from './OneTimeKeyPanel';
 
 type AppActionsProps = {
-  id: string;
-  name: string;
+  app: AppDetails;
 };
 
 type PendingAction = 'rotate' | 'deactivate' | null;
@@ -20,7 +20,8 @@ async function readError(response: Response, fallback: string): Promise<string> 
   }
 }
 
-export function AppActions({ id, name }: AppActionsProps) {
+export function AppActions({ app }: AppActionsProps) {
+  const { id, name } = app;
   const router = useRouter();
   const [pending, setPending] = useState<PendingAction>(null);
   const [working, setWorking] = useState(false);
@@ -166,6 +167,7 @@ export function AppActions({ id, name }: AppActionsProps) {
         </div>
       ) : (
         <div className="actions">
+          <AppDetailsModal app={app} />
           <button
             className="button secondary button-sm"
             type="button"
