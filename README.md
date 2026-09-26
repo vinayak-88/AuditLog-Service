@@ -681,7 +681,3 @@ Identify the first broken entry
 Do not perform this against data you need to preserve. The trigger bypass is only for controlled testing.
 
 ---
-
-## License
-
-Add the repository's chosen license here if/when one is selected.
